@@ -47,9 +47,9 @@ type containerViewHandler func(*ContainerView, Action) error
 // ContainerView is a container with no visual presence that manages the
 // layout of its child views
 type ContainerView struct {
-	channels                    *Channels
+	channels                    Channels
 	config                      Config
-	childViews                  []AbstractView
+	childViews                  []BaseView
 	title                       string
 	viewWins                    map[WindowView]*Window
 	emptyWin                    *Window
@@ -59,24 +59,30 @@ type ContainerView struct {
 	childViewPositionCalculator ChildViewPositionCalculator
 	viewID                      ViewID
 	fullScreen                  bool
+	childPositions              []*ChildViewPosition
+	styleConfig                 WindowStyleConfig
+	viewState                   ViewState
 	lock                        sync.Mutex
 }
 
 // NewContainerView creates a new instance
-func NewContainerView(channels *Channels, config Config) *ContainerView {
+func NewContainerView(channels Channels, config Config) *ContainerView {
 	containerView := &ContainerView{
 		config:      config,
 		channels:    channels,
 		orientation: CoVertical,
 		viewID:      ViewContainer,
 		viewWins:    make(map[WindowView]*Window),
+		styleConfig: DefaultWindowStyleConfig(),
 		handlers: map[ActionType]containerViewHandler{
 			ActionNextView:         nextContainerChildView,
 			ActionPrevView:         prevContainerChildView,
 			ActionFullScreenView:   toggleFullScreenChildView,
 			ActionToggleViewLayout: toggleViewOrientation,
+			ActionAddView:          addView,
 			ActionSplitView:        splitView,
 			ActionRemoveView:       removeView,
+			ActionMouseSelect:      childMouseClick,
 		},
 	}
 
@@ -86,7 +92,7 @@ func NewContainerView(channels *Channels, config Config) *ContainerView {
 }
 
 // AddChildViews adds new child views to this container
-func (containerView *ContainerView) AddChildViews(newViews ...AbstractView) {
+func (containerView *ContainerView) AddChildViews(newViews ...BaseView) {
 	containerView.lock.Lock()
 	defer containerView.lock.Unlock()
 
@@ -95,14 +101,7 @@ func (containerView *ContainerView) AddChildViews(newViews ...AbstractView) {
 	}
 }
 
-func (containerView *ContainerView) addChildView(newView AbstractView) {
-	if !containerView.isEmpty() {
-		if childView, isContainerView := containerView.activeChildView().(*ContainerView); isContainerView {
-			childView.AddChildViews(newView)
-			return
-		}
-	}
-
+func (containerView *ContainerView) addChildView(newView BaseView) {
 	log.Debugf("Adding new view %T", newView)
 
 	containerView.childViews = append(containerView.childViews, newView)
@@ -111,8 +110,9 @@ func (containerView *ContainerView) addChildView(newView AbstractView) {
 		log.Debugf("Creating window for new view %T", newView)
 		viewIndex := len(containerView.childViews) - 1
 		winID := fmt.Sprintf("%v-%T", viewIndex, windowView)
-		win := NewWindow(winID, containerView.config)
+		win := NewWindowWithStyleConfig(winID, containerView.config, containerView.styleConfig)
 		containerView.viewWins[windowView] = win
+		containerView.onStateChange(containerView.viewState)
 	}
 }
 
@@ -148,6 +148,14 @@ func (containerView *ContainerView) SetViewID(viewID ViewID) {
 	containerView.viewID = viewID
 }
 
+// SetWindowStyleConfig sets the window style config for the child views
+func (containerView *ContainerView) SetWindowStyleConfig(styleConfig WindowStyleConfig) {
+	containerView.lock.Lock()
+	defer containerView.lock.Unlock()
+
+	containerView.styleConfig = styleConfig
+}
+
 // Initialise initialises this containers child views
 func (containerView *ContainerView) Initialise() (err error) {
 	containerView.lock.Lock()
@@ -160,6 +168,16 @@ func (containerView *ContainerView) Initialise() (err error) {
 	}
 
 	return
+}
+
+// Dispose of any resources held by the view
+func (containerView *ContainerView) Dispose() {
+	containerView.lock.Lock()
+	defer containerView.lock.Unlock()
+
+	for !containerView.isEmpty() {
+		removeView(containerView, Action{ActionType: ActionRemoveView})
+	}
 }
 
 // HandleEvent passes the event on to all child views
@@ -192,20 +210,29 @@ func (containerView *ContainerView) HandleAction(action Action) (err error) {
 	return
 }
 
-// OnActiveChange updates the active state of this container and its child views
-func (containerView *ContainerView) OnActiveChange(active bool) {
+// OnStateChange updates the active state of this container and its child views
+func (containerView *ContainerView) OnStateChange(viewState ViewState) {
 	containerView.lock.Lock()
 	defer containerView.lock.Unlock()
 
-	containerView.onActiveChange(active)
+	containerView.onStateChange(viewState)
 }
 
-func (containerView *ContainerView) onActiveChange(active bool) {
+func (containerView *ContainerView) onStateChange(viewState ViewState) {
+	containerView.viewState = viewState
+
+	var inactiveChildViewState ViewState
+	if viewState == ViewStateActive {
+		inactiveChildViewState = ViewStateInactiveAndVisible
+	} else {
+		inactiveChildViewState = viewState
+	}
+
 	for index, childView := range containerView.childViews {
 		if uint(index) == containerView.activeViewIndex {
-			childView.OnActiveChange(active)
+			childView.OnStateChange(viewState)
 		} else {
-			childView.OnActiveChange(false)
+			childView.OnStateChange(inactiveChildViewState)
 		}
 	}
 }
@@ -229,7 +256,7 @@ func (containerView *ContainerView) RenderHelpBar(lineBuilder *LineBuilder) (err
 	}
 
 	if renderHelp {
-		RenderKeyBindingHelp(containerView.ViewID(), lineBuilder, []ActionMessage{
+		RenderKeyBindingHelp(containerView.ViewID(), lineBuilder, containerView.config, []ActionMessage{
 			{action: ActionNextView, message: "Next View"},
 			{action: ActionPrevView, message: "Prev View"},
 			{action: ActionFullScreenView, message: "Full Screen"},
@@ -266,10 +293,10 @@ func (containerView *ContainerView) Render(viewDimension ViewDimension) (wins []
 		childViewNum:    uint(len(containerView.childViews)),
 	}
 
-	childPositions := containerView.childViewPositionCalculator.CalculateChildViewPositions(&viewLayoutData)
+	containerView.childPositions = containerView.childViewPositionCalculator.CalculateChildViewPositions(&viewLayoutData)
 
 	for childViewIndex, childView := range containerView.childViews {
-		childPosition := childPositions[childViewIndex]
+		childPosition := containerView.childPositions[childViewIndex]
 		if childPosition.viewDimension.cols == 0 || childPosition.viewDimension.rows == 0 {
 			continue
 		}
@@ -392,7 +419,7 @@ func (containerView *ContainerView) renderWindowView(childView WindowView, child
 
 func (containerView *ContainerView) renderEmptyView(viewDimension ViewDimension) *Window {
 	if containerView.emptyWin == nil {
-		containerView.emptyWin = NewWindow("empty", containerView.config)
+		containerView.emptyWin = NewWindowWithStyleConfig("empty", containerView.config, containerView.styleConfig)
 	}
 
 	win := containerView.emptyWin
@@ -403,7 +430,7 @@ func (containerView *ContainerView) renderEmptyView(viewDimension ViewDimension)
 }
 
 // ActiveView returns the active child view
-func (containerView *ContainerView) ActiveView() AbstractView {
+func (containerView *ContainerView) ActiveView() BaseView {
 	containerView.lock.Lock()
 	defer containerView.lock.Unlock()
 
@@ -434,7 +461,7 @@ func (containerView *ContainerView) isEmpty() bool {
 	return len(containerView.childViews) == 0
 }
 
-func (containerView *ContainerView) activeChildView() AbstractView {
+func (containerView *ContainerView) activeChildView() BaseView {
 	return containerView.childViews[containerView.activeViewIndex]
 }
 
@@ -444,7 +471,8 @@ func (containerView *ContainerView) removeActiveChildView() {
 	}
 
 	index := containerView.activeViewIndex
-	log.Debugf("Removing child view %T at index %v", containerView.activeChildView(), index)
+	childView := containerView.activeChildView()
+	log.Debugf("Removing child view %T at index %v", childView, index)
 
 	containerView.childViews = append(containerView.childViews[:index], containerView.childViews[index+1:]...)
 	childViewNum := uint(len(containerView.childViews))
@@ -559,7 +587,7 @@ func nextContainerChildView(containerView *ContainerView, action Action) (err er
 		}
 	}
 
-	containerView.onActiveChange(true)
+	containerView.onStateChange(containerView.viewState)
 	containerView.channels.UpdateDisplay()
 
 	return
@@ -574,7 +602,7 @@ func prevContainerChildView(containerView *ContainerView, action Action) (err er
 		}
 	}
 
-	containerView.onActiveChange(true)
+	containerView.onStateChange(containerView.viewState)
 	containerView.channels.UpdateDisplay()
 
 	return
@@ -617,6 +645,29 @@ func toggleViewOrientation(containerView *ContainerView, action Action) (err err
 	return
 }
 
+func addView(containerView *ContainerView, action Action) (err error) {
+	if !containerView.isEmpty() {
+		if child, isContainerView := containerView.activeChildView().(*ContainerView); isContainerView {
+			return child.HandleAction(action)
+		}
+	}
+
+	args := action.Args
+
+	if len(args) < 1 {
+		return fmt.Errorf("Execpted view but received: %v", args)
+	}
+
+	newView, ok := args[0].(BaseView)
+	if !ok {
+		return fmt.Errorf("Execpted second argument to be BaseView but got %T", args[0])
+	}
+
+	containerView.addChildView(newView)
+
+	return
+}
+
 func splitView(containerView *ContainerView, action Action) (err error) {
 	args := action.Args
 
@@ -646,10 +697,11 @@ func splitView(containerView *ContainerView, action Action) (err error) {
 			containerView.orientation = orientation
 		} else {
 			newContainer := NewContainerView(containerView.channels, containerView.config)
+			newContainer.SetWindowStyleConfig(containerView.styleConfig)
 			newContainer.SetOrientation(orientation)
 			newContainer.AddChildViews(childView, newView)
 			containerView.childViews[containerView.activeViewIndex] = newContainer
-			newContainer.OnActiveChange(true)
+			newContainer.OnStateChange(containerView.viewState)
 		}
 
 		containerView.channels.UpdateDisplay()
@@ -681,7 +733,35 @@ func removeView(containerView *ContainerView, action Action) (err error) {
 		})
 	}
 
-	containerView.onActiveChange(true)
+	containerView.onStateChange(containerView.viewState)
+	containerView.channels.UpdateDisplay()
+
+	return
+}
+
+func childMouseClick(containerView *ContainerView, action Action) (err error) {
+	if containerView.isEmpty() {
+		return
+	}
+
+	mouseEvent, err := GetMouseEventFromAction(action)
+	if err != nil {
+		return
+	}
+
+	for childIndex, childPosition := range containerView.childPositions {
+		if mouseEvent.row >= childPosition.startRow && mouseEvent.row < childPosition.startRow+childPosition.viewDimension.rows &&
+			mouseEvent.col >= childPosition.startCol && mouseEvent.col < childPosition.startCol+childPosition.viewDimension.cols {
+			containerView.activeViewIndex = uint(childIndex)
+			mouseEvent.col -= childPosition.startCol
+			mouseEvent.row -= childPosition.startRow
+			action.Args[0] = mouseEvent
+			err = containerView.activeChildView().HandleAction(action)
+			break
+		}
+	}
+
+	containerView.onStateChange(containerView.viewState)
 	containerView.channels.UpdateDisplay()
 
 	return

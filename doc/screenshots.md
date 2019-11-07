@@ -3,6 +3,15 @@
 ### Status View
 ![Screenshot](./grv-status-view.png)
 
+### Commit Graph
+![Screenshot](./grv-commit-graph.png)
+
+### Fancy Diff Format
+![Screenshot](./grv-fancy-diff.png)
+
+### Modify Repository
+![Screenshot](./grv-available-actions.png)
+
 ### Vertical Split
 ![Screenshot](./grv-commit-views.png)
 
@@ -13,6 +22,4 @@
 ![Screenshot](./grv-classic-theme.png)
 
 ### Old Demo
-
 ![Demo](./grv.gif)
-

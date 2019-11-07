@@ -54,6 +54,10 @@ type RenderedRef struct {
 	refNum          uint
 }
 
+func (renderedRef *RenderedRef) isSelectable() bool {
+	return renderedRef.renderedRefType != RvSpace && renderedRef.renderedRefType != RvLoading
+}
+
 type renderedRefSet interface {
 	Add(*RenderedRef)
 	AddChild(renderedRefSet)
@@ -156,17 +160,19 @@ func (renderedRefList *renderedRefList) Children() (children uint) {
 
 // RefView manages the display of references
 type RefView struct {
-	channels      *Channels
-	repoData      RepoData
-	refLists      []*refList
-	refListeners  []RefListener
-	active        bool
-	renderedRefs  renderedRefSet
-	viewPos       ViewPos
-	viewDimension ViewDimension
-	handlers      map[ActionType]refViewHandler
-	viewSearch    *ViewSearch
-	lock          sync.Mutex
+	*SelectableRowView
+	channels          Channels
+	repoData          RepoData
+	repoController    RepoController
+	config            Config
+	refLists          []*refList
+	refListeners      []RefListener
+	renderedRefs      renderedRefSet
+	activeViewPos     ViewPos
+	lastViewDimension ViewDimension
+	handlers          map[ActionType]refViewHandler
+	variables         GRVVariableSetter
+	lock              sync.Mutex
 }
 
 // RefListener is notified when a reference is selected
@@ -175,12 +181,15 @@ type RefListener interface {
 }
 
 // NewRefView creates a new instance
-func NewRefView(repoData RepoData, channels *Channels) *RefView {
+func NewRefView(repoData RepoData, repoController RepoController, channels Channels, config Config, variables GRVVariableSetter) *RefView {
 	refView := &RefView{
-		channels:     channels,
-		repoData:     repoData,
-		viewPos:      NewViewPosition(),
-		renderedRefs: newRenderedRefList(),
+		channels:       channels,
+		repoData:       repoData,
+		repoController: repoController,
+		config:         config,
+		variables:      variables,
+		activeViewPos:  NewViewPosition(),
+		renderedRefs:   newRenderedRefList(),
 		refLists: []*refList{
 			{
 				name:            "Branches",
@@ -200,24 +209,25 @@ func NewRefView(repoData RepoData, channels *Channels) *RefView {
 			},
 		},
 		handlers: map[ActionType]refViewHandler{
-			ActionPrevLine:     moveUpRef,
-			ActionNextLine:     moveDownRef,
-			ActionPrevPage:     moveUpRefPage,
-			ActionNextPage:     moveDownRefPage,
-			ActionPrevHalfPage: moveUpRefHalfPage,
-			ActionNextHalfPage: moveDownRefHalfPage,
-			ActionScrollRight:  scrollRefViewRight,
-			ActionScrollLeft:   scrollRefViewLeft,
-			ActionFirstLine:    moveToFirstRef,
-			ActionLastLine:     moveToLastRef,
-			ActionSelect:       selectRef,
-			ActionAddFilter:    addRefFilter,
-			ActionRemoveFilter: removeRefFilter,
-			ActionCenterView:   centerRefView,
+			ActionSelect:                  selectRef,
+			ActionAddFilter:               addRefFilter,
+			ActionRemoveFilter:            removeRefFilter,
+			ActionMouseSelect:             mouseSelectRef,
+			ActionCheckoutRef:             checkoutRef,
+			ActionCheckoutPreviousRef:     checkoutPreviousRef,
+			ActionCreateBranch:            createBranchFromRef,
+			ActionCreateBranchAndCheckout: createBranchFromRefAndCheckout,
+			ActionCreateTag:               createTagFromRef,
+			ActionCreateAnnotatedTag:      createAnnotatedTagFromRef,
+			ActionPushRef:                 pushRef,
+			ActionDeleteRef:               deleteRef,
+			ActionShowAvailableActions:    showActionsForRef,
+			ActionMergeRef:                mergeRef,
+			ActionRebase:                  rebase,
 		},
 	}
 
-	refView.viewSearch = NewViewSearch(refView, channels)
+	refView.SelectableRowView = NewSelectableRowView(refView, channels, config, variables, &refView.lock, "ref")
 
 	return refView
 }
@@ -225,6 +235,8 @@ func NewRefView(repoData RepoData, channels *Channels) *RefView {
 // Initialise loads the HEAD reference along with branches and tags
 func (refView *RefView) Initialise() (err error) {
 	log.Info("Initialising RefView")
+	refView.lock.Lock()
+	defer refView.lock.Unlock()
 
 	if err = refView.repoData.LoadHead(); err != nil {
 		return
@@ -247,7 +259,8 @@ func (refView *RefView) Initialise() (err error) {
 			}
 		}
 
-		refView.viewPos.SetActiveRowIndex(activeRowIndex)
+		refView.activeViewPos.SetActiveRowIndex(activeRowIndex)
+		refView.setVariables()
 		refView.channels.UpdateDisplay()
 
 		refView.repoData.RegisterRefStateListener(refView)
@@ -263,12 +276,14 @@ func (refView *RefView) Initialise() (err error) {
 	return
 }
 
-func getDetachedHeadDisplayValue(oid *Oid) string {
-	return fmt.Sprintf("HEAD detached at %s", oid.String()[0:7])
+// Dispose of any resources held by the view
+func (refView *RefView) Dispose() {
+
 }
 
-func isSelectableRenderedRef(renderedRefType RenderedRefType) bool {
-	return renderedRefType != RvSpace && renderedRefType != RvLoading
+// GetDetachedHeadDisplayValue generates a HEAD detached message
+func GetDetachedHeadDisplayValue(oid *Oid) string {
+	return fmt.Sprintf("HEAD detached at %s", oid.ShortID())
 }
 
 // RegisterRefListener adds a ref listener to be notified when a reference is selected
@@ -345,16 +360,15 @@ func (refView *RefView) OnTrackingBranchesUpdated(trackingBranches []*LocalBranc
 
 // Render generates and writes the ref view to the provided window
 func (refView *RefView) Render(win RenderWindow) (err error) {
-	log.Debug("Rendering RefView")
 	refView.lock.Lock()
 	defer refView.lock.Unlock()
 
-	refView.viewDimension = win.ViewDimensions()
+	refView.lastViewDimension = win.ViewDimensions()
 
 	renderedRefs := refView.renderedRefs.RenderedRefs()
 	renderedRefNum := uint(len(renderedRefs))
 	rows := win.Rows() - 2
-	viewPos := refView.viewPos
+	viewPos := refView.activeViewPos
 	viewPos.DetermineViewStartRow(rows, renderedRefNum)
 	refIndex := viewPos.ViewStartRowIndex()
 	startColumn := viewPos.ViewStartColumn()
@@ -386,7 +400,7 @@ func (refView *RefView) Render(win RenderWindow) (err error) {
 		refIndex++
 	}
 
-	if err = win.SetSelectedRow(viewPos.SelectedRowIndex()+1, refView.active); err != nil {
+	if err = win.SetSelectedRow(viewPos.SelectedRowIndex()+1, refView.viewState); err != nil {
 		return
 	}
 
@@ -412,8 +426,9 @@ func (refView *RefView) Render(win RenderWindow) (err error) {
 
 // RenderHelpBar generates key binding help info for the ref view
 func (refView *RefView) RenderHelpBar(lineBuilder *LineBuilder) (err error) {
-	RenderKeyBindingHelp(refView.ViewID(), lineBuilder, []ActionMessage{
+	RenderKeyBindingHelp(refView.ViewID(), lineBuilder, refView.config, []ActionMessage{
 		{action: ActionSelect, message: "Select"},
+		{action: ActionShowAvailableActions, message: "Show actions for ref"},
 		{action: ActionFilterPrompt, message: "Add Filter"},
 		{action: ActionRemoveFilter, message: "Remove Filter"},
 	})
@@ -503,7 +518,7 @@ func (refView *RefView) generateRenderedRefs() {
 		}
 	}
 
-	viewPos := refView.viewPos
+	viewPos := refView.activeViewPos
 	renderedRefNum := uint(len(renderedRefs.RenderedRefs()))
 
 	if viewPos.ActiveRowIndex() >= renderedRefNum {
@@ -513,9 +528,12 @@ func (refView *RefView) generateRenderedRefs() {
 
 		if renderedRef.renderedRefType == RvSpace {
 			log.Debugf("Active row is empty. Moving to previous row")
-			moveUpRef(refView, Action{ActionType: ActionPrevLine})
+			refView.SelectableRowView.HandleAction(Action{ActionType: ActionPrevLine})
 		}
 	}
+
+	refView.channels.ReportError(refView.selectNearestSelectableRow())
+	refView.setVariables()
 }
 
 func generateBranches(refView *RefView, refList *refList, renderedRefs renderedRefSet) {
@@ -541,7 +559,7 @@ func generateBranches(refView *RefView, refList *refList, renderedRefs renderedR
 
 		if _, isDetached := head.(*HEAD); isDetached {
 			renderedRefs.Add(&RenderedRef{
-				value:           fmt.Sprintf("   %s", getDetachedHeadDisplayValue(head.Oid())),
+				value:           fmt.Sprintf("   %s", GetDetachedHeadDisplayValue(head.Oid())),
 				renderedRefType: branchRenderedRefType,
 				refNum:          branchNum,
 				ref:             head,
@@ -630,45 +648,16 @@ func (refView *RefView) createRefListenerView(ref Ref) {
 	})
 }
 
-// OnActiveChange updates whether the ref view is active or not
-func (refView *RefView) OnActiveChange(active bool) {
-	log.Debugf("RefView active: %v", active)
-	refView.lock.Lock()
-	defer refView.lock.Unlock()
-
-	refView.active = active
-}
-
 // ViewID returns the view ID of the ref view
 func (refView *RefView) ViewID() ViewID {
 	return ViewRef
 }
 
-// ViewPos returns the current cursor position in the view
-func (refView *RefView) ViewPos() ViewPos {
-	return refView.viewPos
+func (refView *RefView) viewPos() ViewPos {
+	return refView.activeViewPos
 }
 
-// OnSearchMatch updates the view position to the matched search position
-func (refView *RefView) OnSearchMatch(startPos ViewPos, matchLineIndex uint) {
-	refView.lock.Lock()
-	defer refView.lock.Unlock()
-
-	renderedRefs := refView.renderedRefs.RenderedRefs()
-	renderedRef := renderedRefs[matchLineIndex]
-
-	if isSelectableRenderedRef(renderedRef.renderedRefType) {
-		refView.viewPos.SetActiveRowIndex(matchLineIndex)
-	} else {
-		log.Debugf("Unable to select search match at index %v as it is not a selectable type", matchLineIndex)
-	}
-}
-
-// Line returns the rendered line specified by the provided line index
-func (refView *RefView) Line(lineIndex uint) (line string) {
-	refView.lock.Lock()
-	defer refView.lock.Unlock()
-
+func (refView *RefView) line(lineIndex uint) (line string) {
 	renderedRefs := refView.renderedRefs.RenderedRefs()
 	renderedRefNum := uint(len(renderedRefs))
 
@@ -683,14 +672,56 @@ func (refView *RefView) Line(lineIndex uint) (line string) {
 	return
 }
 
-// LineNumber returns the number of lines in the ref view
-func (refView *RefView) LineNumber() (lineNumber uint) {
-	refView.lock.Lock()
-	defer refView.lock.Unlock()
+func (refView *RefView) rows() uint {
+	renderedRefs := refView.renderedRefs.RenderedRefs()
+	return uint(len(renderedRefs))
+}
+
+func (refView *RefView) viewDimension() ViewDimension {
+	return refView.lastViewDimension
+}
+
+func (refView *RefView) onRowSelected(rowIndex uint) (err error) {
+	refView.setVariables()
+	return
+}
+
+func (refView *RefView) isSelectableRow(rowIndex uint) (isSelectable bool) {
+	if rowIndex >= refView.rows() {
+		return
+	}
 
 	renderedRefs := refView.renderedRefs.RenderedRefs()
-	renderedRefNum := uint(len(renderedRefs))
-	return renderedRefNum
+	renderedRef := renderedRefs[rowIndex]
+
+	return renderedRef.isSelectable()
+}
+
+func (refView *RefView) setVariables() {
+	refView.SelectableRowView.setVariables()
+
+	selectedRefIndex := refView.viewPos().ActiveRowIndex()
+	var branch, tag string
+
+	if selectedRefIndex < refView.rows() {
+		renderedRefs := refView.renderedRefs.RenderedRefs()
+		renderedRef := renderedRefs[selectedRefIndex]
+
+		if renderedRef.renderedRefType == RvLocalBranch || renderedRef.renderedRefType == RvRemoteBranch {
+			branch = renderedRef.ref.Name()
+		} else if renderedRef.renderedRefType == RvTag {
+			tag = renderedRef.ref.Name()
+		} else if renderedRef.renderedRefType == RvHead {
+			if _, isDetached := renderedRef.ref.(*HEAD); !isDetached {
+				branch = renderedRef.ref.Name()
+			}
+		}
+	}
+
+	if branch != "" || tag != "" {
+		refView.variables.SetViewVariable(VarBranch, branch, refView.viewState)
+		refView.variables.SetViewVariable(VarTag, tag, refView.viewState)
+	}
 }
 
 // HandleEvent reacts to an event
@@ -724,193 +755,33 @@ func (refView *RefView) removeRefListener(refListener RefListener) {
 	}
 }
 
+func (refView *RefView) selectedRef() (renderedRef *RenderedRef) {
+	selectedIndex := refView.activeViewPos.ActiveRowIndex()
+
+	if refView.rows() == 0 || selectedIndex >= refView.rows() {
+		return
+	}
+
+	renderedRefs := refView.renderedRefs.RenderedRefs()
+	renderedRef = renderedRefs[selectedIndex]
+
+	return
+}
+
 // HandleAction checks if the rev view supports an action and executes it if so
 func (refView *RefView) HandleAction(action Action) (err error) {
 	log.Debugf("RefView handling action %v", action)
 	refView.lock.Lock()
 	defer refView.lock.Unlock()
 
+	var handled bool
 	if handler, ok := refView.handlers[action.ActionType]; ok {
+		log.Debugf("Action handled by RefView")
 		err = handler(refView, action)
+	} else if handled, err = refView.SelectableRowView.HandleAction(action); handled {
+		log.Debugf("Action handled by SelectableRowView")
 	} else {
-		_, err = refView.viewSearch.HandleAction(action)
-	}
-
-	return
-}
-
-func moveUpRef(refView *RefView, action Action) (err error) {
-	viewPos := refView.viewPos
-
-	if viewPos.ActiveRowIndex() == 0 {
-		return
-	}
-
-	log.Debug("Moving up one ref")
-
-	renderedRefs := refView.renderedRefs.RenderedRefs()
-	startIndex := viewPos.ActiveRowIndex()
-	activeRowIndex := startIndex - 1
-
-	for activeRowIndex > 0 {
-		renderedRef := renderedRefs[activeRowIndex]
-
-		if isSelectableRenderedRef(renderedRef.renderedRefType) {
-			break
-		}
-
-		activeRowIndex--
-	}
-
-	renderedRef := renderedRefs[activeRowIndex]
-	if isSelectableRenderedRef(renderedRef.renderedRefType) {
-		viewPos.SetActiveRowIndex(activeRowIndex)
-		refView.channels.UpdateDisplay()
-	} else {
-		log.Debug("No valid ref entry to move to")
-	}
-
-	return
-}
-
-func moveDownRef(refView *RefView, action Action) (err error) {
-	renderedRefs := refView.renderedRefs.RenderedRefs()
-	renderedRefNum := uint(len(renderedRefs))
-	viewPos := refView.viewPos
-
-	if renderedRefNum == 0 || !(viewPos.ActiveRowIndex() < renderedRefNum-1) {
-		return
-	}
-
-	log.Debug("Moving down one ref")
-
-	startIndex := viewPos.ActiveRowIndex()
-	activeRowIndex := startIndex + 1
-
-	for activeRowIndex < renderedRefNum-1 {
-		renderedRef := renderedRefs[activeRowIndex]
-
-		if isSelectableRenderedRef(renderedRef.renderedRefType) {
-			break
-		}
-
-		activeRowIndex++
-	}
-
-	renderedRef := renderedRefs[activeRowIndex]
-	if isSelectableRenderedRef(renderedRef.renderedRefType) {
-		viewPos.SetActiveRowIndex(activeRowIndex)
-		refView.channels.UpdateDisplay()
-	} else {
-		log.Debug("No valid ref entry to move to")
-	}
-
-	return
-}
-
-func moveUpRefPage(refView *RefView, action Action) (err error) {
-	pageSize := refView.viewDimension.rows - 2
-	viewPos := refView.viewPos
-
-	for viewPos.ActiveRowIndex() > 0 && pageSize > 0 {
-		if err = moveUpRef(refView, action); err != nil {
-			break
-		} else {
-			pageSize--
-		}
-	}
-
-	return
-}
-
-func moveDownRefPage(refView *RefView, action Action) (err error) {
-	renderedRefs := refView.renderedRefs.RenderedRefs()
-	renderedRefNum := uint(len(renderedRefs))
-	pageSize := refView.viewDimension.rows - 2
-	viewPos := refView.viewPos
-
-	for viewPos.ActiveRowIndex()+1 < renderedRefNum && pageSize > 0 {
-		if err = moveDownRef(refView, action); err != nil {
-			break
-		} else {
-			pageSize--
-		}
-	}
-
-	return
-}
-
-func moveUpRefHalfPage(refView *RefView, action Action) (err error) {
-	halfPageSize := refView.viewDimension.rows/2 - 2
-	viewPos := refView.viewPos
-
-	for viewPos.ActiveRowIndex() > 0 && halfPageSize > 0 {
-		if err = moveUpRef(refView, action); err != nil {
-			break
-		} else {
-			halfPageSize--
-		}
-	}
-
-	return
-}
-
-func moveDownRefHalfPage(refView *RefView, action Action) (err error) {
-	renderedRefs := refView.renderedRefs.RenderedRefs()
-	renderedRefNum := uint(len(renderedRefs))
-	halfPageSize := refView.viewDimension.rows/2 - 2
-	viewPos := refView.viewPos
-
-	for viewPos.ActiveRowIndex()+1 < renderedRefNum && halfPageSize > 0 {
-		if err = moveDownRef(refView, action); err != nil {
-			break
-		} else {
-			halfPageSize--
-		}
-	}
-
-	return
-}
-
-func scrollRefViewRight(refView *RefView, action Action) (err error) {
-	viewPos := refView.viewPos
-	viewPos.MovePageRight(refView.viewDimension.cols)
-	log.Debugf("Scrolling right. View starts at column %v", viewPos.ViewStartColumn())
-	refView.channels.UpdateDisplay()
-
-	return
-}
-
-func scrollRefViewLeft(refView *RefView, action Action) (err error) {
-	viewPos := refView.viewPos
-
-	if viewPos.MovePageLeft(refView.viewDimension.cols) {
-		log.Debugf("Scrolling left. View starts at column %v", viewPos.ViewStartColumn())
-		refView.channels.UpdateDisplay()
-	}
-
-	return
-}
-
-func moveToFirstRef(refView *RefView, action Action) (err error) {
-	viewPos := refView.viewPos
-
-	if viewPos.MoveToFirstLine() {
-		log.Debugf("Moving to first ref")
-		refView.channels.UpdateDisplay()
-	}
-
-	return
-}
-
-func moveToLastRef(refView *RefView, action Action) (err error) {
-	viewPos := refView.viewPos
-	renderedRefs := refView.renderedRefs.RenderedRefs()
-	renderedRefNum := uint(len(renderedRefs))
-
-	if viewPos.MoveToLastLine(renderedRefNum) {
-		log.Debugf("Moving to last ref")
-		refView.channels.UpdateDisplay()
+		log.Debugf("Action not handled")
 	}
 
 	return
@@ -918,7 +789,7 @@ func moveToLastRef(refView *RefView, action Action) (err error) {
 
 func selectRef(refView *RefView, action Action) (err error) {
 	renderedRefs := refView.renderedRefs.RenderedRefs()
-	renderedRef := renderedRefs[refView.viewPos.ActiveRowIndex()]
+	renderedRef := renderedRefs[refView.activeViewPos.ActiveRowIndex()]
 
 	switch renderedRef.renderedRefType {
 	case RvLocalBranchGroup, RvRemoteBranchGroup, RvTagGroup:
@@ -938,7 +809,7 @@ func selectRef(refView *RefView, action Action) (err error) {
 		}
 		refView.channels.UpdateDisplay()
 	default:
-		log.Warn("Unexpected ref type %v", renderedRef.renderedRefType)
+		log.Warnf("Unexpected ref type %v", renderedRef.renderedRefType)
 	}
 
 	return
@@ -986,13 +857,555 @@ func removeRefFilter(refView *RefView, action Action) (err error) {
 	return
 }
 
-func centerRefView(refView *RefView, action Action) (err error) {
-	viewPos := refView.viewPos
+func mouseSelectRef(refView *RefView, action Action) (err error) {
+	mouseEvent, err := GetMouseEventFromAction(action)
+	if err != nil {
+		return
+	}
 
-	if viewPos.CenterActiveRow(refView.viewDimension.rows - 2) {
-		log.Debug("Centering RefView")
+	if mouseEvent.row == 0 || mouseEvent.row == refView.lastViewDimension.rows-1 {
+		return
+	}
+
+	viewPos := refView.activeViewPos
+	selectedIndex := viewPos.ViewStartRowIndex() + mouseEvent.row - 1
+
+	renderedRefs := refView.renderedRefs.RenderedRefs()
+	renderedRefNum := uint(len(renderedRefs))
+
+	if selectedIndex >= renderedRefNum {
+		return
+	}
+
+	renderedRef := renderedRefs[selectedIndex]
+
+	if !renderedRef.isSelectable() {
+		return
+	}
+
+	if viewPos.ActiveRowIndex() == selectedIndex {
+		err = selectRef(refView, action)
+	} else {
+		viewPos.SetActiveRowIndex(selectedIndex)
 		refView.channels.UpdateDisplay()
 	}
+
+	return
+}
+
+func checkoutRef(refView *RefView, action Action) (err error) {
+	renderedRefs := refView.renderedRefs.RenderedRefs()
+	renderedRef := renderedRefs[refView.activeViewPos.ActiveRowIndex()]
+
+	if renderedRef.ref == nil {
+		return
+	}
+
+	if refView.config.GetBool(CfConfirmCheckout) {
+		question := fmt.Sprintf("Are you sure you want to checkout ref %v?", renderedRef.ref.Shorthand())
+
+		refView.channels.DoAction(YesNoQuestion(question, func(response QuestionResponse) {
+			if response == ResponseYes {
+				refView.performCheckoutRef(renderedRef)
+			}
+		}))
+	} else {
+		refView.performCheckoutRef(renderedRef)
+	}
+
+	return
+}
+
+func checkoutPreviousRef(refView *RefView, action Action) (err error) {
+	if refView.config.GetBool(CfConfirmCheckout) {
+		question := "Are you sure you want to checkout the previous ref?"
+		refView.channels.DoAction(YesNoQuestion(question, func(response QuestionResponse) {
+			if response == ResponseYes {
+				refView.repoController.CheckoutPreviousRef(func(ref Ref, err error) {
+					refView.onRefCheckoutOut(ref, err)
+				})
+			}
+		}))
+	} else {
+		refView.repoController.CheckoutPreviousRef(func(ref Ref, err error) {
+			refView.onRefCheckoutOut(ref, err)
+		})
+	}
+
+	return
+}
+
+func (refView *RefView) performCheckoutRef(renderedRef *RenderedRef) {
+	refView.repoController.CheckoutRef(renderedRef.ref, func(ref Ref, err error) {
+		refView.onRefCheckoutOut(ref, err)
+	})
+}
+
+func (refView *RefView) onRefCheckoutOut(ref Ref, err error) {
+	refView.lock.Lock()
+	defer refView.lock.Unlock()
+
+	if err != nil {
+		refView.channels.ReportError(err)
+		return
+	}
+
+	refView.generateRenderedRefs()
+
+	if err = refView.setSelectedRowToRef(ref); err != nil {
+		refView.channels.ReportError(err)
+		return
+	}
+
+	refView.channels.ReportStatus("Checked out %v", ref.Shorthand())
+}
+
+func (refView *RefView) setSelectedRowToRef(ref Ref) (err error) {
+	for renderedRefIndex, renderedRef := range refView.renderedRefs.RenderedRefs() {
+		if renderedRef.ref != nil && renderedRef.ref.Equal(ref) {
+			refView.activeViewPos.SetActiveRowIndex(uint(renderedRefIndex))
+			return selectRef(refView, Action{})
+		}
+	}
+
+	log.Errorf("Unable to find ref %v to select", ref.Name())
+	return
+}
+
+func (refView *RefView) processRefNameAction(action Action, promptAction, nextAction ActionType) (refName string, ref Ref, err error) {
+	if len(action.Args) == 0 {
+		refView.channels.DoAction(Action{
+			ActionType: promptAction,
+			Args:       []interface{}{nextAction},
+		})
+
+		return
+	}
+
+	refName, isString := action.Args[0].(string)
+	if !isString {
+		err = fmt.Errorf("Expected first argument to be ref name but found %T", action.Args[0])
+		return
+	}
+
+	renderedRefs := refView.renderedRefs.RenderedRefs()
+	renderedRef := renderedRefs[refView.activeViewPos.ActiveRowIndex()]
+	ref = renderedRef.ref
+
+	return
+}
+
+func createBranchFromRef(refView *RefView, action Action) (err error) {
+	branchName, ref, err := refView.processRefNameAction(action, ActionBranchNamePrompt, ActionCreateBranch)
+	if err != nil || ref == nil || branchName == "" {
+		return
+	}
+
+	if err = refView.repoController.CreateBranch(branchName, ref.Oid()); err != nil {
+		return
+	}
+
+	refView.channels.ReportStatus("Created branch %v at %v", branchName, ref.Oid().ShortID())
+
+	return
+}
+
+func createBranchFromRefAndCheckout(refView *RefView, action Action) (err error) {
+	branchName, ref, err := refView.processRefNameAction(action, ActionBranchNamePrompt, ActionCreateBranchAndCheckout)
+	if err != nil || ref == nil || branchName == "" {
+		return
+	}
+
+	refView.repoController.CreateBranchAndCheckout(branchName, ref.Oid(), func(ref Ref, err error) {
+		refView.lock.Lock()
+		defer refView.lock.Unlock()
+
+		if err != nil {
+			refView.channels.ReportError(fmt.Errorf("Failed to create and checkout branch %v", branchName))
+			return
+		}
+
+		refView.generateRenderedRefs()
+
+		if err = refView.setSelectedRowToRef(ref); err != nil {
+			refView.channels.ReportError(err)
+		}
+
+		refView.channels.ReportStatus("Created and checked out branch %v", branchName)
+	})
+
+	return
+}
+
+func createTagFromRef(refView *RefView, action Action) (err error) {
+	tagName, ref, err := refView.processRefNameAction(action, ActionTagNamePrompt, ActionCreateTag)
+	if err != nil || ref == nil || tagName == "" {
+		return
+	}
+
+	if err = refView.repoController.CreateTag(tagName, ref.Oid()); err != nil {
+		return
+	}
+
+	refView.channels.ReportStatus("Created tag %v at %v", tagName, ref.Oid().ShortID())
+
+	return
+}
+
+func createAnnotatedTagFromRef(refView *RefView, action Action) (err error) {
+	tagName, ref, err := refView.processRefNameAction(action, ActionTagNamePrompt, ActionCreateAnnotatedTag)
+	if err != nil || ref == nil || tagName == "" {
+		return
+	}
+
+	refView.repoController.CreateAnnotatedTag(tagName, ref.Oid(), func(ref Ref, err error) {
+		refView.lock.Lock()
+		defer refView.lock.Unlock()
+
+		if err != nil {
+			refView.channels.ReportError(fmt.Errorf("Failed to create annotated tag %v", tagName))
+			return
+		}
+
+		refView.generateRenderedRefs()
+
+		refView.channels.ReportStatus("Created annotated tag %v at %v", tagName, ref.Oid().ShortID())
+	})
+
+	return
+}
+
+func pushRef(refView *RefView, action Action) (err error) {
+	renderedRef := refView.selectedRef()
+	if renderedRef == nil || renderedRef.ref == nil {
+		return
+	}
+
+	ref := renderedRef.ref
+
+	var track bool
+
+	switch rawRef := ref.(type) {
+	case *LocalBranch:
+		track = !rawRef.IsTrackingBranch()
+	case *RemoteBranch:
+		return
+	case *HEAD:
+		return
+	}
+
+	remotes := refView.repoData.Remotes()
+	var remote string
+
+	if len(remotes) == 0 {
+		return fmt.Errorf("Cannot push ref: No remotes configured")
+	} else if len(remotes) > 1 {
+		if len(action.Args) == 0 {
+			refView.showRemotesMenu(func(selectedValue interface{}) {
+				refView.channels.DoAction(Action{
+					ActionType: action.ActionType,
+					Args:       []interface{}{selectedValue},
+				})
+			})
+			return
+		} else if remoteName, ok := action.Args[0].(string); ok {
+			remote = remoteName
+		} else {
+			return fmt.Errorf("Expected to find remote argument")
+		}
+	} else {
+		remote = remotes[0]
+	}
+
+	refView.runReportingTask("Running git push", func(quit chan bool) {
+		refView.repoController.Push(remote, ref, track, func(err error) {
+			if err != nil {
+				refView.channels.ReportError(err)
+				refView.channels.ReportStatus("git push failed")
+			} else {
+				refView.channels.ReportStatus("git push for remote %v and ref %v complete", remote, ref.Shorthand())
+			}
+
+			close(quit)
+		})
+	})
+
+	return
+}
+
+func deleteRef(refView *RefView, action Action) (err error) {
+	renderedRef := refView.selectedRef()
+	if renderedRef == nil || renderedRef.ref == nil {
+		return
+	} else if _, isDetached := renderedRef.ref.(*HEAD); isDetached {
+		return
+	}
+
+	ref := renderedRef.ref
+	remote := false
+
+	question := fmt.Sprintf("Are you sure you want to delete %v?", ref.Shorthand())
+
+	refView.channels.DoAction(YesNoQuestion(question, func(deleteResponse QuestionResponse) {
+		if deleteResponse == ResponseNo {
+			return
+		}
+
+		switch rawRef := ref.(type) {
+		case *LocalBranch:
+			if refView.repoData.Head().Equal(ref) {
+				refView.channels.ReportError(fmt.Errorf("Cannot delete currently checked out branch"))
+				return
+			}
+
+			if err = refView.repoController.DeleteLocalRef(ref); err != nil {
+				refView.channels.ReportError(err)
+				return
+			}
+
+			remote = rawRef.IsTrackingBranch()
+		case *Tag:
+			if err = refView.repoController.DeleteLocalRef(ref); err != nil {
+				refView.channels.ReportError(err)
+				return
+			}
+
+			remote = true
+		case *RemoteBranch:
+			refView.deleteRemoteRef(rawRef.remoteName, ref)
+			return
+		default:
+			return
+		}
+
+		refView.channels.ReportStatus("Deleted ref %v", ref.Shorthand())
+
+		remotes := refView.repoData.Remotes()
+		if remote && len(remotes) > 0 {
+			question := "Do you want to delete the corresponding remote ref as well?"
+
+			refView.channels.DoAction(YesNoQuestion(question, func(deleteRemoteResponse QuestionResponse) {
+				if deleteRemoteResponse == ResponseYes {
+					if len(remotes) > 1 {
+						refView.showRemotesMenu(func(selectedValue interface{}) {
+							if remote, ok := selectedValue.(string); ok {
+								refView.deleteRemoteRef(remote, ref)
+							} else {
+								log.Debugf("Expected string value for remote but found: %T", selectedValue)
+							}
+						})
+					} else {
+						refView.deleteRemoteRef(remotes[0], ref)
+					}
+				}
+			}))
+		}
+	}))
+
+	return
+}
+
+func (refView *RefView) deleteRemoteRef(remote string, ref Ref) {
+	refView.runReportingTask(fmt.Sprintf("Deleting ref %v on remote %v", ref.Shorthand(), remote), func(quit chan bool) {
+		refView.repoController.DeleteRemoteRef(remote, ref, func(err error) {
+			if err != nil {
+				refView.channels.ReportError(err)
+				refView.channels.ReportStatus("Deleting ref %v on remote %v failed", ref.Shorthand(), remote)
+			} else {
+				refView.channels.ReportStatus("Deleted ref %v on remote %v", ref.Shorthand(), remote)
+			}
+
+			close(quit)
+		})
+	})
+}
+
+func (refView *RefView) showRemotesMenu(consumer Consumer) {
+	remotes := refView.repoData.Remotes()
+	contextMenuEntries := []ContextMenuEntry{}
+
+	for _, remote := range remotes {
+		contextMenuEntries = append(contextMenuEntries, ContextMenuEntry{
+			DisplayName: remote,
+			Value:       remote,
+		})
+	}
+
+	refView.channels.DoAction(Action{
+		ActionType: ActionCreateContextMenu,
+		Args: []interface{}{
+			ActionCreateContextMenuArgs{
+				viewDimension: ViewDimension{
+					rows: 5,
+					cols: 40,
+				},
+				config: ContextMenuConfig{
+					Entity:  "Remote",
+					Entries: contextMenuEntries,
+					OnSelect: func(entry ContextMenuEntry, entryIndex uint) {
+						consumer(entry.Value)
+					},
+				},
+			},
+		},
+	})
+}
+
+func mergeRef(refView *RefView, action Action) (err error) {
+	renderedRef := refView.selectedRef()
+	if renderedRef == nil || renderedRef.ref == nil {
+		return
+	}
+
+	ref := renderedRef.ref
+	head := refView.repoData.Head()
+
+	if refView.repoController.MergeRef(ref) == nil {
+		refView.channels.ReportStatus("Merged %v into %v", ref.Shorthand(), head.Shorthand())
+	} else {
+		refView.channels.ReportStatus("Merged failed")
+		refView.channels.DoAction(Action{
+			ActionType: ActionSelectTabByName,
+			Args:       []interface{}{StatusViewTitle},
+		})
+	}
+
+	return
+}
+
+func rebase(refView *RefView, action Action) (err error) {
+	renderedRef := refView.selectedRef()
+	head := refView.repoData.Head()
+
+	if renderedRef == nil || renderedRef.ref == nil {
+		return
+	} else if _, isLocalBranch := renderedRef.ref.(*LocalBranch); !isLocalBranch {
+		return fmt.Errorf("Selected ref is not a local branch")
+	} else if _, isHeadLocalBranch := head.(*LocalBranch); !isHeadLocalBranch {
+		return fmt.Errorf("HEAD is not a local branch")
+	}
+
+	ref := renderedRef.ref
+
+	if refView.repoController.Rebase(ref) == nil {
+		refView.channels.ReportStatus("Rebased %v onto %v", head.Shorthand(), ref.Shorthand())
+	} else {
+		refView.channels.ReportStatus("Rebase failed")
+		refView.channels.DoAction(Action{
+			ActionType: ActionSelectTabByName,
+			Args:       []interface{}{StatusViewTitle},
+		})
+	}
+
+	return
+}
+
+func showActionsForRef(refView *RefView, action Action) (err error) {
+	if refView.rows() == 0 {
+		return
+	}
+
+	renderedRefs := refView.renderedRefs.RenderedRefs()
+	renderedRef := renderedRefs[refView.activeViewPos.ActiveRowIndex()]
+
+	if renderedRef.ref == nil {
+		return
+	}
+
+	refName := renderedRef.ref.Shorthand()
+	if StringWidth(refName) > 15 {
+		refName = refName[:15] + "..."
+	}
+
+	var contextMenuEntries []ContextMenuEntry
+
+	_, isHead := renderedRef.ref.(*HEAD)
+	if !isHead {
+		contextMenuEntries = append(contextMenuEntries, ContextMenuEntry{
+			DisplayName: fmt.Sprintf("Checkout %v", refName),
+			Value:       Action{ActionType: ActionCheckoutRef},
+		})
+	}
+
+	contextMenuEntries = append(contextMenuEntries,
+		ContextMenuEntry{
+			DisplayName: "Checkout previous ref",
+			Value:       Action{ActionType: ActionCheckoutPreviousRef},
+		},
+		ContextMenuEntry{
+			DisplayName: fmt.Sprintf("Create branch from %v", refName),
+			Value:       Action{ActionType: ActionCreateBranch},
+		},
+		ContextMenuEntry{
+			DisplayName: fmt.Sprintf("Create branch from %v and checkout", refName),
+			Value:       Action{ActionType: ActionCreateBranchAndCheckout},
+		},
+		ContextMenuEntry{
+			DisplayName: fmt.Sprintf("Create tag at %v", refName),
+			Value:       Action{ActionType: ActionCreateTag},
+		},
+		ContextMenuEntry{
+			DisplayName: fmt.Sprintf("Create annotated tag at %v", refName),
+			Value:       Action{ActionType: ActionCreateAnnotatedTag},
+		},
+	)
+
+	_, isLocalBranch := renderedRef.ref.(*LocalBranch)
+	_, isTag := renderedRef.ref.(*Tag)
+
+	if isLocalBranch || isTag {
+		contextMenuEntries = append(contextMenuEntries, ContextMenuEntry{
+			DisplayName: fmt.Sprintf("Push %v to remote", refName),
+			Value:       Action{ActionType: ActionPushRef},
+		})
+	}
+
+	head := refView.repoData.Head()
+	headName := head.Shorthand()
+	if StringWidth(headName) > 12 {
+		headName = headName[:12] + "..."
+	}
+
+	if !isHead {
+		contextMenuEntries = append(contextMenuEntries, ContextMenuEntry{
+			DisplayName: fmt.Sprintf("Delete %v", refName),
+			Value:       Action{ActionType: ActionDeleteRef},
+		})
+
+		if !head.Equal(renderedRef.ref) {
+			contextMenuEntries = append(contextMenuEntries, ContextMenuEntry{
+				DisplayName: fmt.Sprintf("Merge %v into %v", refName, headName),
+				Value:       Action{ActionType: ActionMergeRef},
+			})
+			contextMenuEntries = append(contextMenuEntries, ContextMenuEntry{
+				DisplayName: fmt.Sprintf("Rebase %v onto %v", headName, refName),
+				Value:       Action{ActionType: ActionRebase},
+			})
+		}
+	}
+
+	refView.channels.DoAction(Action{
+		ActionType: ActionCreateContextMenu,
+		Args: []interface{}{
+			ActionCreateContextMenuArgs{
+				viewDimension: ViewDimension{
+					rows: uint(MinInt(len(contextMenuEntries)+2, 15)),
+					cols: 60,
+				},
+				config: ContextMenuConfig{
+					ActionView: ViewRef,
+					Entries:    contextMenuEntries,
+					OnSelect: func(entry ContextMenuEntry, entryIndex uint) {
+						if selectedAction, ok := entry.Value.(Action); ok {
+							refView.channels.DoAction(selectedAction)
+						} else {
+							log.Errorf("Expected Action instance but found: %v", entry.Value)
+						}
+					},
+				},
+			},
+		},
+	})
 
 	return
 }

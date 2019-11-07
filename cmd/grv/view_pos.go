@@ -17,6 +17,13 @@ type ViewPos interface {
 	MoveToFirstLine() (changed bool)
 	MoveToLastLine(rows uint) (changed bool)
 	CenterActiveRow(pageRows uint) (changed bool)
+	ScrollActiveRowTop() (changed bool)
+	ScrollActiveRowBottom(pageRows uint) (changed bool)
+	MoveCursorTopPage() (changed bool)
+	MoveCursorMiddlePage(pageRows, rows uint) (changed bool)
+	MoveCursorBottomPage(pageRows, rows uint) (changed bool)
+	ScrollDown(rows, pageRows, scrollRows uint) (changed bool)
+	ScrollUp(pageRows, scrollRows uint) (changed bool)
 }
 
 // ViewPosition implements the ViewPos interface
@@ -71,7 +78,7 @@ func (viewPos *ViewPosition) DetermineViewStartRow(viewRows, rows uint) {
 	} else if rowDiff := viewPos.activeRowIndex - viewPos.viewStartRowIndex; rowDiff >= viewRows {
 		viewPos.viewStartRowIndex += (rowDiff - viewRows) + 1
 	} else if visibleRows := rows - (viewPos.viewStartRowIndex + 1); visibleRows < viewRows && viewPos.viewStartRowIndex > 0 {
-		viewPos.viewStartRowIndex -= MinUint(viewPos.viewStartRowIndex, (viewRows-visibleRows)-1)
+		viewPos.viewStartRowIndex -= MinUInt(viewPos.viewStartRowIndex, (viewRows-visibleRows)-1)
 	}
 }
 
@@ -98,7 +105,7 @@ func (viewPos *ViewPosition) MoveLineUp() (changed bool) {
 // MovePageDown moves the cursor and display down a page
 func (viewPos *ViewPosition) MovePageDown(pageRows, rows uint) (changed bool) {
 	if viewPos.activeRowIndex+1 < rows {
-		viewPos.activeRowIndex += MinUint(pageRows, rows-(viewPos.activeRowIndex+1))
+		viewPos.activeRowIndex += MinUInt(pageRows, rows-(viewPos.activeRowIndex+1))
 		viewPos.viewStartRowIndex = viewPos.activeRowIndex
 		changed = true
 	}
@@ -109,7 +116,7 @@ func (viewPos *ViewPosition) MovePageDown(pageRows, rows uint) (changed bool) {
 // MovePageUp moves the cursor and display up a page
 func (viewPos *ViewPosition) MovePageUp(pageRows uint) (changed bool) {
 	if viewPos.activeRowIndex > 0 {
-		viewPos.activeRowIndex -= MinUint(pageRows, viewPos.activeRowIndex)
+		viewPos.activeRowIndex -= MinUInt(pageRows, viewPos.activeRowIndex)
 		viewPos.viewStartRowIndex = viewPos.activeRowIndex
 		changed = true
 	}
@@ -169,8 +176,109 @@ func (viewPos *ViewPosition) CenterActiveRow(pageRows uint) (changed bool) {
 		viewPos.viewStartRowIndex += selectedRow - centerRow
 		changed = true
 	} else if centerRow > selectedRow {
-		viewPos.viewStartRowIndex -= MinUint(centerRow-selectedRow, viewPos.viewStartRowIndex)
+		viewPos.viewStartRowIndex -= MinUInt(centerRow-selectedRow, viewPos.viewStartRowIndex)
 		changed = true
+	}
+
+	return
+}
+
+// ScrollActiveRowTop updates the view start position to the cursor
+func (viewPos *ViewPosition) ScrollActiveRowTop() (changed bool) {
+	selectedRow := viewPos.SelectedRowIndex()
+
+	if selectedRow != 0 {
+		viewPos.viewStartRowIndex = viewPos.activeRowIndex
+		changed = true
+	}
+
+	return
+}
+
+// ScrollActiveRowBottom updates the view bottom position to the cursor
+func (viewPos *ViewPosition) ScrollActiveRowBottom(pageRows uint) (changed bool) {
+	selectedRow := viewPos.SelectedRowIndex()
+
+	if selectedRow != pageRows-1 {
+		viewPos.viewStartRowIndex = uint(MaxInt(int(viewPos.activeRowIndex-(pageRows-1)), 0))
+		changed = true
+	}
+
+	return
+}
+
+// MoveCursorTopPage moves the cursor to top of the page
+func (viewPos *ViewPosition) MoveCursorTopPage() (changed bool) {
+	firstRowInPage := viewPos.viewStartRowIndex
+
+	if viewPos.activeRowIndex != firstRowInPage {
+		viewPos.activeRowIndex = firstRowInPage
+		changed = true
+	}
+
+	return
+}
+
+// MoveCursorMiddlePage moves the cursor to middle of the page
+func (viewPos *ViewPosition) MoveCursorMiddlePage(pageRows, rows uint) (changed bool) {
+	middleRowInPage := viewPos.viewStartRowIndex + MinUInt(pageRows, rows-viewPos.viewStartRowIndex)/2
+
+	if viewPos.activeRowIndex != middleRowInPage {
+		viewPos.activeRowIndex = middleRowInPage
+		changed = true
+	}
+
+	return
+}
+
+// MoveCursorBottomPage moves the cursor to bottom of the page
+func (viewPos *ViewPosition) MoveCursorBottomPage(pageRows, rows uint) (changed bool) {
+	lastRowInPage := MinUInt(viewPos.viewStartRowIndex+pageRows-1, rows-1)
+
+	if viewPos.activeRowIndex != lastRowInPage {
+		viewPos.activeRowIndex = lastRowInPage
+		changed = true
+	}
+
+	return
+}
+
+// ScrollDown scrolls the view down by scrollRows
+func (viewPos *ViewPosition) ScrollDown(rows, pageRows, scrollRows uint) (changed bool) {
+	if viewPos.viewStartRowIndex+scrollRows < rows {
+		viewPos.viewStartRowIndex += scrollRows
+		changed = true
+	}
+
+	if changed {
+		if viewPos.activeRowIndex < viewPos.viewStartRowIndex {
+			viewPos.activeRowIndex = viewPos.viewStartRowIndex
+
+			viewPos.DetermineViewStartRow(pageRows, rows)
+
+			if viewPos.activeRowIndex > viewPos.viewStartRowIndex {
+				viewPos.activeRowIndex = viewPos.viewStartRowIndex
+			}
+		}
+	}
+
+	return
+}
+
+// ScrollUp scrolls the view up by scrollRows
+func (viewPos *ViewPosition) ScrollUp(pageRows, scrollRows uint) (changed bool) {
+	if viewPos.viewStartRowIndex >= scrollRows {
+		viewPos.viewStartRowIndex -= scrollRows
+		changed = true
+	} else if viewPos.viewStartRowIndex != 0 {
+		viewPos.viewStartRowIndex = 0
+		changed = true
+	}
+
+	if changed {
+		if viewPos.activeRowIndex >= viewPos.viewStartRowIndex+pageRows {
+			viewPos.activeRowIndex = (viewPos.viewStartRowIndex + pageRows) - 1
+		}
 	}
 
 	return

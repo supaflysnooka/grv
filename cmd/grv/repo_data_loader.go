@@ -1,24 +1,51 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
 	"reflect"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	log "github.com/Sirupsen/logrus"
 	slice "github.com/bradfitz/slice"
-	git "gopkg.in/libgit2/git2go.v25"
+	git "gopkg.in/libgit2/git2go.v27"
 )
 
 const (
 	// RdlHeadRef is the HEAD ref name
-	RdlHeadRef          = "HEAD"
-	rdlCommitBufferSize = 100
-	rdlDiffStatsCols    = 80
-	rdlShortOidLen      = 7
+	RdlHeadRef                       = "HEAD"
+	rdlCommitBufferSize              = 100
+	rdlDiffStatsCols                 = 80
+	rdlShortOidLen                   = 7
+	rdlCommitLimitDateFormat         = "2006-01-02"
+	rdlCommitLimitDateTimeFormat     = "2006-01-02 15:04:05"
+	rdlCommitLimitDateTimeZoneFormat = "2006-01-02 15:04:05-0700"
+	// GitRepositoryDirectoryName is the name of the git directory in a git repository
+	GitRepositoryDirectoryName = ".git"
 )
+
+var diffErrorRegex = regexp.MustCompile(`Invalid (regexp|collation character)`)
+
+var noCommitLimit = regexp.MustCompile(`^\s*$`)
+var numericCommitLimit = regexp.MustCompile(`^\d+$`)
+var dateCommitLimit = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+var dateTimeCommitLimit = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$`)
+var dateTimeZoneCommitLimit = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(\+|-)\d{4}$`)
+var oidCommitLimit = regexp.MustCompile(`^[[:xdigit:]]+$`)
+
+type commitLimitPredicate func(*git.Commit) bool
+
+var noCommitLimitPredicate = func(*git.Commit) bool {
+	return false
+}
 
 type instanceCache struct {
 	oids       map[string]*Oid
@@ -29,9 +56,13 @@ type instanceCache struct {
 
 // RepoDataLoader handles loading data from the repository
 type RepoDataLoader struct {
-	repo     *git.Repository
-	cache    *instanceCache
-	channels *Channels
+	repo               *git.Repository
+	cache              *instanceCache
+	channels           Channels
+	config             Config
+	commitLimitReached commitLimitPredicate
+	diffErrorPresent   bool
+	gitBinaryConfirmed bool
 }
 
 // Oid is reference to a git object
@@ -193,16 +224,23 @@ func (localBranch *LocalBranch) Equal(other Ref) bool {
 // RemoteBranch contains data for a remote branch reference
 type RemoteBranch struct {
 	*abstractBranch
+	remoteName string
 }
 
-func newRemoteBranch(oid *Oid, name, shorthand string) *RemoteBranch {
+func newRemoteBranch(oid *Oid, remoteName, name, shorthand string) *RemoteBranch {
 	return &RemoteBranch{
 		abstractBranch: &abstractBranch{
 			oid:       oid,
 			name:      name,
 			shorthand: shorthand,
 		},
+		remoteName: remoteName,
 	}
+}
+
+// ShorthandWithoutRemote returns only the branch name
+func (remoteBranch *RemoteBranch) ShorthandWithoutRemote() string {
+	return strings.TrimPrefix(remoteBranch.shorthand, remoteBranch.remoteName+"/")
 }
 
 // IsRemote returns true
@@ -262,7 +300,7 @@ func (tag *Tag) Equal(other Ref) bool {
 		tag.Oid().Equal(otherTag.Oid())
 }
 
-// Tag returns tag data in a string format
+// String returns tag data in a string format
 func (tag *Tag) String() string {
 	return fmt.Sprintf("%v:%v", tag.name, tag.oid)
 }
@@ -304,6 +342,11 @@ func (head *HEAD) Equal(other Ref) bool {
 	}
 
 	return head.Oid().Equal(otherHead.Oid())
+}
+
+// String returns HEAD in a string format
+func (head *HEAD) String() string {
+	return fmt.Sprintf("%v:%v", head.Name(), head.Oid())
 }
 
 // Commit contains data for a commit
@@ -368,6 +411,16 @@ func newStatusEntry(gitStatus git.Status, statusType StatusType, rawStatusEntry 
 	}
 }
 
+// NewFilePath returns the new file path of the status entry
+func (statusEntry *StatusEntry) NewFilePath() string {
+	return statusEntry.diffDelta.NewFile.Path
+}
+
+// OldFilePath returns the old file path of the status entry
+func (statusEntry *StatusEntry) OldFilePath() string {
+	return statusEntry.diffDelta.OldFile.Path
+}
+
 // StatusType describes the different stages a status entry can be in
 type StatusType int
 
@@ -398,14 +451,48 @@ var statusTypeMap = map[git.Status]StatusType{
 	git.StatusConflicted: StConflicted,
 }
 
-// Status contains all git status data
-type Status struct {
-	entries map[StatusType][]*StatusEntry
+// RepositoryState describes the state of the repository
+// e.g. whether an operation is in progress
+type RepositoryState int
+
+// Set of supported repository states
+const (
+	RepositoryStateUnknown RepositoryState = iota
+	RepositoryStateNone
+	RepositoryStateMerge
+	RepositoryStateRevert
+	RepositoryStateCherrypick
+	RepositoryStateBisect
+	RepositoryStateRebase
+	RepositoryStateRebaseInteractive
+	RepositoryStateRebaseMerge
+	RepositoryStateApplyMailbox
+	RepositoryStateApplyMailboxOrRebase
+)
+
+var repositoryStateMap = map[git.RepositoryState]RepositoryState{
+	git.RepositoryStateNone:                 RepositoryStateNone,
+	git.RepositoryStateMerge:                RepositoryStateMerge,
+	git.RepositoryStateRevert:               RepositoryStateRevert,
+	git.RepositoryStateCherrypick:           RepositoryStateCherrypick,
+	git.RepositoryStateBisect:               RepositoryStateBisect,
+	git.RepositoryStateRebase:               RepositoryStateRebase,
+	git.RepositoryStateRebaseInteractive:    RepositoryStateRebaseInteractive,
+	git.RepositoryStateRebaseMerge:          RepositoryStateRebaseMerge,
+	git.RepositoryStateApplyMailbox:         RepositoryStateApplyMailbox,
+	git.RepositoryStateApplyMailboxOrRebase: RepositoryStateApplyMailboxOrRebase,
 }
 
-func newStatus() *Status {
+// Status contains all git status data
+type Status struct {
+	repositoryState RepositoryState
+	entries         map[StatusType][]*StatusEntry
+}
+
+func newStatus(repositoryState RepositoryState) *Status {
 	return &Status{
-		entries: make(map[StatusType][]*StatusEntry),
+		repositoryState: repositoryState,
+		entries:         make(map[StatusType][]*StatusEntry),
 	}
 }
 
@@ -423,13 +510,27 @@ func (status *Status) StatusTypes() (statusTypes []StatusType) {
 }
 
 // Entries returns the status entries for the provided status type
-func (status *Status) Entries(statusType StatusType) []*StatusEntry {
+func (status *Status) Entries(statusType StatusType) (statusEntries []*StatusEntry) {
 	statusEntries, ok := status.entries[statusType]
 	if !ok {
-		return nil
+		return
 	}
 
 	return statusEntries
+}
+
+// FilePaths returns the paths of all files with the provided StatusType
+func (status *Status) FilePaths(statusType StatusType) (filePaths []string) {
+	statusEntries, ok := status.entries[statusType]
+	if !ok {
+		return
+	}
+
+	for _, statusEntry := range statusEntries {
+		filePaths = append(filePaths, statusEntry.NewFilePath())
+	}
+
+	return
 }
 
 // IsEmpty returns true if there are no entries
@@ -495,6 +596,11 @@ func statusEntriesEqual(entries, otherEntries []*StatusEntry) bool {
 	return true
 }
 
+// RepositoryState returns the current repository state
+func (status *Status) RepositoryState() RepositoryState {
+	return status.repositoryState
+}
+
 func newInstanceCache() *instanceCache {
 	return &instanceCache{
 		oids:    make(map[string]*Oid),
@@ -555,48 +661,156 @@ func (cache *instanceCache) getCachedOid(oidStr string) (oid *Oid, exists bool) 
 	return
 }
 
-// NewRepoDataLoader creates a new instance
-func NewRepoDataLoader(channels *Channels) *RepoDataLoader {
-	return &RepoDataLoader{
-		cache:    newInstanceCache(),
-		channels: channels,
+func (repoDataLoader *RepoDataLoader) newCommitLimiter(commitLimitString string) (commitLimitReached commitLimitPredicate, err error) {
+	commitLimitReached = noCommitLimitPredicate
+
+	switch {
+	case noCommitLimit.MatchString(commitLimitString):
+	case numericCommitLimit.MatchString(commitLimitString):
+		var limit int
+		if limit, err = strconv.Atoi(commitLimitString); err != nil {
+			err = fmt.Errorf("Unable to parse commit limit: %v", commitLimitString)
+			return
+		}
+
+		commitCount := 0
+		commitLimitReached = func(*git.Commit) bool {
+			if commitCount >= limit {
+				return true
+			}
+
+			commitCount++
+			return false
+		}
+	case dateCommitLimit.MatchString(commitLimitString):
+		if commitLimitReached, err = generateDateCommitLimitTester(commitLimitString, rdlCommitLimitDateFormat, false); err != nil {
+			err = fmt.Errorf("Failed to parse commit limit date string: %v", err)
+			return
+		}
+	case dateTimeCommitLimit.MatchString(commitLimitString):
+		if commitLimitReached, err = generateDateCommitLimitTester(commitLimitString, rdlCommitLimitDateTimeFormat, false); err != nil {
+			err = fmt.Errorf("Failed to parse commit limit date-time string: %v", err)
+			return
+		}
+	case dateTimeZoneCommitLimit.MatchString(commitLimitString):
+		if commitLimitReached, err = generateDateCommitLimitTester(commitLimitString, rdlCommitLimitDateTimeZoneFormat, true); err != nil {
+			err = fmt.Errorf("Failed to parse commit limit date-time string: %v", err)
+			return
+		}
+	case oidCommitLimit.MatchString(commitLimitString):
+		var object *git.Object
+		if object, err = repoDataLoader.repo.RevparseSingle(commitLimitString); err != nil {
+			err = fmt.Errorf("Invalid oid for commit limit: %v", err)
+			return
+		}
+		defer object.Free()
+
+		if object.Type() != git.ObjectCommit {
+			err = fmt.Errorf("Oid for commit limit does not reference commit: %v", commitLimitString)
+			return
+		}
+
+		oid := object.Id().String()
+
+		commitSeen := false
+		commitLimitReached = func(commit *git.Commit) bool {
+			if commitSeen {
+				return true
+			}
+
+			commitSeen = commit.Id().String() == oid
+
+			return false
+		}
+	default:
+		var object *git.Object
+		if object, err = repoDataLoader.repo.RevparseSingle(commitLimitString); err != nil {
+			err = fmt.Errorf("Invalid tag for commit limit: %v", err)
+			return
+		}
+		defer object.Free()
+
+		if object.Type() != git.ObjectTag {
+			err = fmt.Errorf("Oid for commit limit does not reference tag: %v", commitLimitString)
+			return
+		}
+
+		var tag *git.Tag
+		if tag, err = object.AsTag(); err != nil {
+			err = fmt.Errorf("Unable to load tag with name %v for commit limit: %v", commitLimitString, err)
+			return
+		}
+
+		if tag.TargetType() != git.ObjectCommit {
+			err = fmt.Errorf("Tag for commit limit does not reference commit: %v", commitLimitString)
+			return
+		}
+
+		var commit *git.Commit
+		if commit, err = tag.Target().AsCommit(); err != nil {
+			err = fmt.Errorf("Unable to load commit for commit limit tag %v: %v", commitLimitString, err)
+			return
+		}
+
+		oid := commit.Id().String()
+
+		commitSeen := false
+		commitLimitReached = func(commit *git.Commit) bool {
+			if commitSeen {
+				return true
+			}
+
+			commitSeen = commit.Id().String() == oid
+
+			return false
+		}
 	}
+
+	return
 }
 
-// Free releases any resources
-func (repoDataLoader *RepoDataLoader) Free() {
-	log.Info("Freeing RepoDataLoader")
+func generateDateCommitLimitTester(dateString string, dateFormat string, timeZone bool) (commitLimitReached commitLimitPredicate, err error) {
+	commitLimitReached = noCommitLimitPredicate
 
-	if repoDataLoader.repo != nil {
-		repoDataLoader.repo.Free()
+	dateTime, err := time.Parse(dateFormat, dateString)
+	if err != nil {
+		return
+	}
+
+	if !timeZone {
+		dateTime = TimeWithLocation(dateTime, time.Local)
+	}
+
+	commitLimitReached = func(commit *git.Commit) bool {
+		return commit.Author().When.Before(dateTime)
+	}
+
+	return
+}
+
+// NewRepoDataLoader creates a new instance
+func NewRepoDataLoader(channels Channels, config Config) *RepoDataLoader {
+	return &RepoDataLoader{
+		cache:            newInstanceCache(),
+		channels:         channels,
+		config:           config,
+		diffErrorPresent: true,
 	}
 }
 
 // Initialise attempts to access the repository
-func (repoDataLoader *RepoDataLoader) Initialise(repoPath, workTreePath string) error {
-	log.Infof("Opening repository at %v", repoPath)
-
-	repo, err := git.OpenRepository(repoPath)
-	if err != nil {
-		log.Debugf("Failed to open repository: %v", err)
-		return err
-	}
-
-	if workTreePath != "" {
-		if err = repo.SetWorkdir(workTreePath, false); err != nil {
-			log.Debugf("Failed to set work dir: %v", err)
-			return err
-		}
-	}
-
-	repoDataLoader.repo = repo
-
-	return nil
+func (repoDataLoader *RepoDataLoader) Initialise(repoSupplier RepoSupplier) {
+	repoDataLoader.repo = repoSupplier.RepositoryInstance()
 }
 
 // Path returns the file path location of the repository
 func (repoDataLoader *RepoDataLoader) Path() string {
 	return repoDataLoader.repo.Path()
+}
+
+// Workdir returns working directory file path for the repository
+func (repoDataLoader *RepoDataLoader) Workdir() string {
+	return repoDataLoader.repo.Workdir()
 }
 
 // Head loads the current HEAD ref
@@ -692,11 +906,18 @@ func (repoDataLoader *RepoDataLoader) loadBranches() (branches []Branch, err err
 		var newBranch Branch
 
 		if branch.IsRemote() {
-			newBranch = newRemoteBranch(oid, branch.Reference.Name(), branchName)
+			fullBranchName := branch.Reference.Name()
+			remoteName, err := repoDataLoader.repo.RemoteName(fullBranchName)
+			if err != nil {
+				err = fmt.Errorf("Failed to determine remote for branch %v: %v", fullBranchName, err)
+				return err
+			}
+
+			newBranch = newRemoteBranch(oid, remoteName, fullBranchName, branchName)
 		} else {
 			newBranch, err = newLocalBranch(oid, branch)
 			if err != nil {
-				log.Debugf("Failed to create ref instance for branch %v: %v",
+				err = fmt.Errorf("Failed to create ref instance for branch %v: %v",
 					branch.Reference.Name(), err)
 				return err
 			}
@@ -720,9 +941,20 @@ func (repoDataLoader *RepoDataLoader) loadTags() (tags []*Tag, err error) {
 	}
 	defer refIter.Free()
 
+	var ref *git.Reference
+
 	for {
-		ref, err := refIter.Next()
-		if err != nil || repoDataLoader.channels.Exit() {
+		if repoDataLoader.channels.Exit() {
+			break
+		}
+
+		if ref, err = refIter.Next(); err != nil {
+			if gitError, isGitError := err.(*git.GitError); !isGitError || gitError.Code != git.ErrIterOver {
+				err = fmt.Errorf("Error when loading tags: %v", err)
+			} else {
+				err = nil
+			}
+
 			break
 		}
 
@@ -734,8 +966,8 @@ func (repoDataLoader *RepoDataLoader) loadTags() (tags []*Tag, err error) {
 				name:      ref.Name(),
 				shorthand: ref.Shorthand(),
 			}
-			tags = append(tags, newTag)
 
+			tags = append(tags, newTag)
 			log.Debugf("Loaded tag %v", newTag)
 		}
 	}
@@ -777,6 +1009,12 @@ func (repoDataLoader *RepoDataLoader) CommitRange(commitRange string) (<-chan *C
 
 func (repoDataLoader *RepoDataLoader) loadCommits(revWalk *git.RevWalk) <-chan *Commit {
 	commitCh := make(chan *Commit, rdlCommitBufferSize)
+	commitLimit := repoDataLoader.config.GetString(CfCommitLimit)
+
+	commitLimitReached, err := repoDataLoader.newCommitLimiter(commitLimit)
+	if err != nil {
+		repoDataLoader.channels.ReportError(err)
+	}
 
 	go func() {
 		defer close(commitCh)
@@ -786,6 +1024,9 @@ func (repoDataLoader *RepoDataLoader) loadCommits(revWalk *git.RevWalk) <-chan *
 
 		if err := revWalk.Iterate(func(commit *git.Commit) bool {
 			if repoDataLoader.channels.Exit() {
+				return false
+			} else if commitLimitReached(commit) {
+				repoDataLoader.channels.ReportStatus("Commit limit reached")
 				return false
 			}
 
@@ -893,6 +1134,10 @@ func (repoDataLoader *RepoDataLoader) DiffCommit(commit *Commit) (diff *Diff, er
 		return
 	}
 
+	if repoDataLoader.diffErrorPresent {
+		return repoDataLoader.generateCommitDiffUsingCLI(commit)
+	}
+
 	var commitTree, parentTree *git.Tree
 	if commitTree, err = commit.commit.Tree(); err != nil {
 		return
@@ -917,15 +1162,34 @@ func (repoDataLoader *RepoDataLoader) DiffCommit(commit *Commit) (diff *Diff, er
 	}
 	defer commitDiff.Free()
 
-	return repoDataLoader.generateDiff(commitDiff)
+	if diff, err = repoDataLoader.generateDiff(commitDiff); err != nil && diffErrorRegex.MatchString(err.Error()) {
+		log.Infof("Falling back to git cli after encountering error: %v", err)
+		repoDataLoader.diffErrorPresent = true
+		return repoDataLoader.generateCommitDiffUsingCLI(commit)
+	}
+
+	return
 }
 
 // DiffStage returns a diff for all files in the provided stage
 func (repoDataLoader *RepoDataLoader) DiffStage(statusType StatusType) (diff *Diff, err error) {
+	if repoDataLoader.diffErrorPresent {
+		return repoDataLoader.generateStageDiffUsingCLI(statusType)
+	}
+
 	diff = &Diff{}
 
 	rawDiff, err := repoDataLoader.generateRawDiff(statusType)
-	if err != nil || rawDiff == nil {
+	if err != nil {
+		if diffErrorRegex.MatchString(err.Error()) {
+			log.Infof("Falling back to git cli after encountering error: %v", err)
+			repoDataLoader.diffErrorPresent = true
+			return repoDataLoader.generateStageDiffUsingCLI(statusType)
+		}
+
+		return
+	} else if rawDiff == nil {
+		err = fmt.Errorf("Failed to generate diff for %v files", StatusTypeDisplayName(statusType))
 		return
 	}
 	defer rawDiff.Free()
@@ -937,10 +1201,23 @@ func (repoDataLoader *RepoDataLoader) DiffStage(statusType StatusType) (diff *Di
 // If statusType is StStaged then the diff is between HEAD and the index
 // If statusType is StUnstaged then the diff is between index and the working directory
 func (repoDataLoader *RepoDataLoader) DiffFile(statusType StatusType, path string) (diff *Diff, err error) {
+	if repoDataLoader.diffErrorPresent {
+		return repoDataLoader.generateFileDiffUsingCLI(statusType, path)
+	}
+
 	diff = &Diff{}
 
 	rawDiff, err := repoDataLoader.generateRawDiff(statusType)
-	if err != nil || rawDiff == nil {
+	if err != nil {
+		if diffErrorRegex.MatchString(err.Error()) {
+			log.Infof("Falling back to git cli after encountering error: %v", err)
+			repoDataLoader.diffErrorPresent = true
+			return repoDataLoader.generateFileDiffUsingCLI(statusType, path)
+		}
+
+		return
+	} else if rawDiff == nil {
+		err = fmt.Errorf("Failed to generate diff for %v file %v", StatusTypeDisplayName(statusType), path)
 		return
 	}
 	defer rawDiff.Free()
@@ -984,13 +1261,12 @@ func (repoDataLoader *RepoDataLoader) DiffFile(statusType StatusType, path strin
 func (repoDataLoader *RepoDataLoader) generateRawDiff(statusType StatusType) (rawDiff *git.Diff, err error) {
 	var index *git.Index
 	var options git.DiffOptions
+	var head Ref
+	var commit *Commit
+	var tree *git.Tree
 
 	switch statusType {
 	case StStaged:
-		var head Ref
-		var commit *Commit
-		var tree *git.Tree
-
 		if head, err = repoDataLoader.Head(); err != nil {
 			return
 		}
@@ -1024,6 +1300,26 @@ func (repoDataLoader *RepoDataLoader) generateRawDiff(statusType StatusType) (ra
 		}
 
 		if rawDiff, err = repoDataLoader.repo.DiffIndexToWorkdir(index, &options); err != nil {
+			return
+		}
+	case StConflicted:
+		if head, err = repoDataLoader.Head(); err != nil {
+			return
+		}
+
+		if commit, err = repoDataLoader.Commit(head.Oid()); err != nil {
+			return
+		}
+
+		if tree, err = commit.commit.Tree(); err != nil {
+			return
+		}
+
+		if options, err = git.DefaultDiffOptions(); err != nil {
+			return
+		}
+
+		if rawDiff, err = repoDataLoader.repo.DiffTreeToWorkdir(tree, &options); err != nil {
 			return
 		}
 	}
@@ -1073,6 +1369,120 @@ func (repoDataLoader *RepoDataLoader) generateDiff(rawDiff *git.Diff) (diff *Dif
 	return
 }
 
+type diffType int
+
+const (
+	dtCommit diffType = iota
+	dtStage
+	dtFile
+)
+
+func (repoDataLoader *RepoDataLoader) generateCommitDiffUsingCLI(commit *Commit) (diff *Diff, err error) {
+	log.Debugf("Attempting to load diff using cli for commit: %v", commit.oid.String())
+	gitCommand := []string{"show", "--encoding=UTF8", "--pretty=oneline", "--root", "--patch-with-stat", "--no-color", commit.oid.String()}
+	return repoDataLoader.runGitCLIDiff(gitCommand, dtCommit)
+}
+
+func (repoDataLoader *RepoDataLoader) generateFileDiffUsingCLI(statusType StatusType, path string) (diff *Diff, err error) {
+	log.Debugf("Attempting to load diff using cli for StatusType: %v and file: %v", StatusTypeDisplayName(statusType), path)
+
+	gitCommand := []string{"diff"}
+
+	if statusType == StStaged {
+		gitCommand = append(gitCommand, "--cached")
+	} else if statusType != StUnstaged {
+		return &Diff{}, nil
+	}
+
+	gitCommand = append(gitCommand, []string{"--encoding=UTF8", "--root", "--no-color", "--", path}...)
+
+	return repoDataLoader.runGitCLIDiff(gitCommand, dtFile)
+}
+
+func (repoDataLoader *RepoDataLoader) generateStageDiffUsingCLI(statusType StatusType) (diff *Diff, err error) {
+	log.Debugf("Attempting to load diff using cli for StatusType: %v", StatusTypeDisplayName(statusType))
+
+	gitCommand := []string{"diff"}
+
+	if statusType == StStaged {
+		gitCommand = append(gitCommand, "--cached")
+	} else if statusType != StUnstaged {
+		return &Diff{}, nil
+	}
+
+	gitCommand = append(gitCommand, []string{"--encoding=UTF8", "--root", "--patch-with-stat", "--no-color"}...)
+
+	return repoDataLoader.runGitCLIDiff(gitCommand, dtStage)
+}
+
+func (repoDataLoader *RepoDataLoader) gitBinary() string {
+	if gitBinary := repoDataLoader.config.GetString(CfGitBinaryFilePath); gitBinary != "" {
+		return gitBinary
+	}
+
+	return "git"
+}
+
+func (repoDataLoader *RepoDataLoader) runGitCLIDiff(gitCommand []string, diffType diffType) (diff *Diff, err error) {
+	diff = &Diff{}
+
+	if !repoDataLoader.gitBinaryConfirmed {
+		if exec.Command(repoDataLoader.gitBinary(), "version").Run() == nil {
+			repoDataLoader.gitBinaryConfirmed = true
+		} else {
+			err = fmt.Errorf("Unable to successfully call git binary. "+
+				"If git is not in $PATH then please set the config variable %v", CfGitBinaryFilePath)
+			return
+		}
+	}
+
+	cmd := exec.Command(repoDataLoader.gitBinary(), gitCommand...)
+	cmd.Env, cmd.Dir = repoDataLoader.GenerateGitCommandEnvironment()
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err = cmd.Run(); err != nil {
+		err = fmt.Errorf("Unable to generate commit diff using git cli: %v", err)
+		return
+	}
+
+	if stderr.Len() > 0 {
+		err = fmt.Errorf("Error when generating commit diff using git cli: %v", stderr.String())
+		return
+	}
+
+	scanner := bufio.NewScanner(&stdout)
+
+	if diffType != dtFile {
+		if diffType == dtCommit {
+			scanner.Scan()
+		}
+
+		for scanner.Scan() {
+			if line := scanner.Text(); line == "" {
+				break
+			} else {
+				diff.stats.WriteString(strings.TrimPrefix(line, " "))
+				diff.stats.WriteRune('\n')
+			}
+		}
+	}
+
+	for scanner.Scan() {
+		diff.diffText.WriteString(scanner.Text())
+		diff.diffText.WriteRune('\n')
+	}
+
+	if err = scanner.Err(); err != nil {
+		err = fmt.Errorf("Reading commit diff cli output failed: %v", err)
+		return
+	}
+
+	return
+}
+
 // LoadStatus loads git status and populates a Status instance with the data
 func (repoDataLoader *RepoDataLoader) LoadStatus() (*Status, error) {
 	log.Debug("Loading git status")
@@ -1094,7 +1504,8 @@ func (repoDataLoader *RepoDataLoader) LoadStatus() (*Status, error) {
 		return nil, fmt.Errorf("Unable to determine repository status: %v", err)
 	}
 
-	status := newStatus()
+	repositoryState := repoDataLoader.RepositoryState()
+	status := newStatus(repositoryState)
 
 	for i := 0; i < entryCount; i++ {
 		statusEntry, err := statusList.ByIndex(i)
@@ -1106,4 +1517,60 @@ func (repoDataLoader *RepoDataLoader) LoadStatus() (*Status, error) {
 	}
 
 	return status, nil
+}
+
+// UserEditor returns the editor git is configured to use
+func (repoDataLoader *RepoDataLoader) UserEditor() (editor string, err error) {
+	config, err := repoDataLoader.repo.Config()
+	if err != nil {
+		err = fmt.Errorf("Unable to retrieve git config: %v", err)
+	}
+
+	if editor, _ = config.LookupString("core.editor"); editor != "" {
+		return
+	}
+
+	editor = os.Getenv("GIT_EDITOR")
+	return
+}
+
+// GenerateGitCommandEnvironment populates git environment variables for
+// the current repository
+func (repoDataLoader *RepoDataLoader) GenerateGitCommandEnvironment() (env []string, rootDir string) {
+	env = os.Environ()
+
+	gitDir := repoDataLoader.Path()
+	if gitDir != "" {
+		env = append(env, fmt.Sprintf("GIT_DIR=%v", gitDir))
+	}
+
+	workdir := repoDataLoader.Workdir()
+	if workdir != "" {
+		env = append(env, fmt.Sprintf("GIT_WORK_TREE=%v", workdir))
+		rootDir = workdir
+	} else {
+		rootDir = strings.TrimSuffix(gitDir, GitRepositoryDirectoryName)
+	}
+
+	return
+}
+
+// RepositoryState returns the current repository state
+func (repoDataLoader *RepoDataLoader) RepositoryState() RepositoryState {
+	repositoryState := repoDataLoader.repo.State()
+
+	if mappedRepositoryState, ok := repositoryStateMap[repositoryState]; ok {
+		return mappedRepositoryState
+	}
+
+	return RepositoryStateUnknown
+}
+
+// Remotes loads remotes for the repository
+func (repoDataLoader *RepoDataLoader) Remotes() (remotes []string, err error) {
+	if remotes, err = repoDataLoader.repo.Remotes.List(); err != nil {
+		err = fmt.Errorf("Failed to determine remotes: %v", err)
+	}
+
+	return
 }

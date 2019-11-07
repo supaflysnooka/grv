@@ -94,18 +94,162 @@ func TestViewAllBindingIsAvailableInAllViews(t *testing.T) {
 	checkBinding(binding, isPrefix, expectedBinding, false, t)
 }
 
-func TestDefaultKeyBindingsReturnsBindings(t *testing.T) {
-	tests := map[ActionType][]string{
-		ActionFirstLine:    {"gg"},
-		ActionScrollLeft:   {"<Left>", "h"},
-		ActionFilterPrompt: {"<C-q>"},
+func TestKeyStringsReturnsExpectedBoundKeys(t *testing.T) {
+	keyBindings := NewKeyBindingManager()
+
+	keyBindings.SetActionBinding(ViewAll, "aaa", ActionFirstLine)
+	keyBindings.SetKeystringBinding(ViewAll, "bbb", "<grv-first-line>")
+
+	expectedKeystrings := []BoundKeyString{
+		{
+			keystring:          "gg",
+			userDefinedBinding: false,
+		},
+		{
+			keystring:          "aaa",
+			userDefinedBinding: true,
+		},
+		{
+			keystring:          "bbb",
+			userDefinedBinding: true,
+		},
 	}
 
-	for actionType, expectedKeys := range tests {
-		actualKeys := DefaultKeyBindings(actionType, ViewCommit)
+	actualKeystrings := keyBindings.KeyStrings(ActionFirstLine, ViewAll)
 
-		if !reflect.DeepEqual(expectedKeys, actualKeys) {
-			t.Errorf("DefaultKeyBindings result did not match expected result. Expected: %v, Actual: %v", expectedKeys, actualKeys)
+	if !reflect.DeepEqual(expectedKeystrings, actualKeystrings) {
+		t.Errorf("Returned keystrings did not match expected value. Expected: %v, Actual: %v", expectedKeystrings, actualKeystrings)
+	}
+}
+
+func TestRemoveBindingRemovesBinding(t *testing.T) {
+	keyBindings := NewKeyBindingManager()
+
+	keyBindings.SetActionBinding(ViewRef, "aaa", ActionFirstLine)
+	removed := keyBindings.RemoveBinding(ViewRef, "aaa")
+	binding, isPrefix := keyBindings.Binding(ViewHierarchy([]ViewID{ViewMain, ViewHistory, ViewRef}), "aaa")
+
+	if !removed {
+		t.Errorf("Expected binding to be removed")
+	}
+
+	expectedBinding := newActionBinding(ActionNone)
+	checkBinding(binding, isPrefix, expectedBinding, false, t)
+}
+
+func TestRemoveBindingRemovesNothingWhenNoBindingExists(t *testing.T) {
+	keyBindings := NewKeyBindingManager()
+
+	removed := keyBindings.RemoveBinding(ViewRef, "aaa")
+
+	if removed {
+		t.Errorf("Expected no binding to be removed")
+	}
+}
+
+func TestRemoveBindingDoesNotAffectSubTreeBindings(t *testing.T) {
+	keyBindings := NewKeyBindingManager()
+
+	keyBindings.SetActionBinding(ViewRef, "aaa", ActionFirstLine)
+	keyBindings.SetActionBinding(ViewRef, "aaaa", ActionLastLine)
+	keyBindings.RemoveBinding(ViewRef, "aaa")
+	binding, isPrefix := keyBindings.Binding(ViewHierarchy([]ViewID{ViewMain, ViewHistory, ViewRef}), "aaaa")
+
+	expectedBinding := newActionBinding(ActionLastLine)
+	checkBinding(binding, isPrefix, expectedBinding, false, t)
+}
+
+func TestIsPromptActionCorrectlyIdentifiesPromptActions(t *testing.T) {
+	tests := map[ActionType]bool{
+		ActionPrompt:              true,
+		ActionSearchPrompt:        true,
+		ActionReverseSearchPrompt: true,
+		ActionFilterPrompt:        true,
+		ActionSearch:              false,
+		ActionLastLine:            false,
+		ActionRemoveTab:           false,
+		ActionPrevPage:            false,
+	}
+
+	for actionType, expectedValue := range tests {
+		if IsPromptAction(actionType) != expectedValue {
+			t.Errorf("IsPromptAction did not returns expected value %v for action %v", expectedValue, actionType)
+		}
+	}
+}
+
+func TestMouseEventActionReturnsExpectedActions(t *testing.T) {
+	mouseEventLeftClick := MouseEvent{
+		mouseEventType: MetLeftClick,
+		row:            10,
+		col:            20,
+	}
+
+	tests := map[MouseEvent]Action{
+		mouseEventLeftClick: {
+			ActionType: ActionMouseSelect,
+			Args:       []interface{}{mouseEventLeftClick},
+		},
+		{mouseEventType: MetScrollDown}: {ActionType: ActionMouseScrollDown},
+		{mouseEventType: MetScrollUp}:   {ActionType: ActionMouseScrollUp},
+	}
+
+	for mouseEvent, expectedAction := range tests {
+		actualAction, err := MouseEventAction(mouseEvent)
+
+		if err != nil {
+			t.Errorf("MouseEventAction failed with error: %v", err)
+		} else if !reflect.DeepEqual(actualAction, expectedAction) {
+			t.Errorf("Returned action did not match expected action. Actual: %v. Expected: %v", actualAction, expectedAction)
+		}
+	}
+}
+
+func TestMouseEventActionReturnsAnErrorForAnInvalidMouseEventType(t *testing.T) {
+	_, err := MouseEventAction(MouseEvent{mouseEventType: MouseEventType(-5)})
+
+	if err == nil {
+		t.Errorf("Expected MouseEventAction to return error for invalid MouseEventType")
+	}
+}
+
+func TestGetMouseEventFromActionExtractsMouseEventFromAction(t *testing.T) {
+	mouseEventLeftClick := MouseEvent{
+		mouseEventType: MetLeftClick,
+		row:            10,
+		col:            20,
+	}
+	action := Action{
+		ActionType: ActionMouseSelect,
+		Args:       []interface{}{mouseEventLeftClick},
+	}
+
+	actualMouseEvent, err := GetMouseEventFromAction(action)
+
+	if err != nil {
+		t.Errorf("GetMouseEventFromAction failed with error: %v", err)
+	} else if !reflect.DeepEqual(actualMouseEvent, mouseEventLeftClick) {
+		t.Errorf("Returned MouseEvent did not match expected event. Actual: %v. Expected: %v", actualMouseEvent, mouseEventLeftClick)
+	}
+}
+
+func TestGetMouseEventReturnsErrorsForInvalidActions(t *testing.T) {
+	if _, err := GetMouseEventFromAction(Action{}); err == nil {
+		t.Errorf("Expected GetMouseEventFromAction to return error for action with empty Args")
+	}
+
+	if _, err := GetMouseEventFromAction(Action{Args: []interface{}{5}}); err == nil {
+		t.Errorf("Expected GetMouseEventFromAction to return error for action with invalid Args")
+	}
+}
+
+func TestActionDescriptorsHaveADescription(t *testing.T) {
+	for actionType, actionDescriptor := range actionDescriptors {
+		if actionDescriptor.actionCategory == ActionCategoryNone {
+			t.Errorf("ActionDescriptor for ActionType %v and ActionKey %v has no category specified", actionType, actionDescriptor.actionKey)
+		}
+		if actionDescriptor.description == "" {
+			t.Errorf("ActionDescriptor for ActionType %v and ActionKey %v has no description", actionType, actionDescriptor.actionKey)
 		}
 	}
 }

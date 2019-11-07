@@ -8,24 +8,43 @@ package main
 //
 // #include <stdio.h>
 // #include <stdlib.h>
+// #include <string.h>
 // #include <readline/readline.h>
 // #include <readline/history.h>
 //
 // extern void grvReadlineUpdateDisplay(void);
+// extern int grvReadlineStartUpHook(void);
+// extern int grvReadlineEventHook(void);
+// extern int grvReadlineEscapeHandler(int, int);
 //
 // static void grv_init_readline(void) {
 // 	rl_redisplay_function = grvReadlineUpdateDisplay;
+//	rl_startup_hook = grvReadlineStartUpHook;
+//	rl_event_hook = grvReadlineEventHook;
 //	rl_catch_signals = 0;
 //	rl_catch_sigwinch = 0;
 //#if RL_READLINE_VERSION >= 0x0603
 //	rl_change_environment = 0;
 //#endif
 //	rl_bind_key('\t', NULL);
+//	rl_bind_key(0x1B, grvReadlineEscapeHandler);
+// 	rl_set_keyboard_input_timeout(250000);
 //
 //	history_write_timestamps = 1;
 //	history_comment_char = '#';
 //	using_history();
 // }
+//
+// static void grv_add_history(const char *input) {
+// 	const HIST_ENTRY *last_entry = history_get(history_length);
+//
+//	if (last_entry && !strcmp(last_entry->line, input)) {
+//		return;
+//	}
+//
+//	add_history(input);
+// }
+//
 import "C"
 
 import (
@@ -37,9 +56,11 @@ import (
 )
 
 const (
-	rlCommandHistoryFile = "/command_history"
-	rlSearchHistoryFile  = "/search_history"
-	rlFilterHistoryFile  = "/filter_history"
+	rlCommandHistoryFile    = "/command_history"
+	rlSearchHistoryFile     = "/search_history"
+	rlFilterHistoryFile     = "/filter_history"
+	rlBranchNameHistoryFile = "/branch_name_history"
+	rlTagNameHistoryFile    = "/tag_name_history"
 )
 
 var historyFilePrompts = map[string]string{
@@ -47,32 +68,52 @@ var historyFilePrompts = map[string]string{
 	SearchPromptText:        rlSearchHistoryFile,
 	ReverseSearchPromptText: rlSearchHistoryFile,
 	FilterPromptText:        rlFilterHistoryFile,
+	BranchNamePromptText:    rlBranchNameHistoryFile,
+	TagNamePromptText:       rlTagNameHistoryFile,
+}
+
+// PromptArgs contains arguments to configure the display of a prompt
+type PromptArgs struct {
+	Prompt            string
+	InitialBufferText string
+	NumCharsToRead    int
 }
 
 var readLine ReadLine
 
 // ReadLine is a wrapper around the readline library
 type ReadLine struct {
-	channels       *Channels
-	ui             InputUI
-	config         Config
-	promptText     string
-	promptInput    string
-	promptPoint    int
-	active         bool
-	lastPromptText string
-	lock           sync.Mutex
+	channels          Channels
+	config            Config
+	promptText        string
+	promptInput       string
+	promptPoint       int
+	active            bool
+	lastPromptText    string
+	initialBufferText string
+	lock              sync.Mutex
 }
 
 // InitReadLine initialises the readline library
-func InitReadLine(channels *Channels, ui InputUI, config Config) {
+func InitReadLine(channels Channels, config Config) {
 	readLine = ReadLine{
 		channels: channels,
 		config:   config,
-		ui:       ui,
 	}
 
 	C.grv_init_readline()
+
+	promptHistorySize := readLine.config.GetInt(CfPromptHistorySize)
+	readLineStifleHistory(promptHistorySize)
+
+	config.AddOnChangeListener(CfPromptHistorySize, &readLine)
+}
+
+func (readLine *ReadLine) onConfigVariableChange(configVariable ConfigVariable) {
+	if configVariable == CfPromptHistorySize {
+		promptHistorySize := readLine.config.GetInt(CfPromptHistorySize)
+		readLineStifleHistory(promptHistorySize)
+	}
 }
 
 // FreeReadLine flushes any history to disk
@@ -119,18 +160,27 @@ func writeHistoryFile(file string) {
 	C.free(unsafe.Pointer(cHistoryFilePath))
 }
 
-// Prompt shows a readline prompt using prompt text provided
+// Prompt shows a readline prompt using the args provided
 // User input is returned
-func Prompt(prompt string) string {
-	cPrompt := C.CString(prompt)
+func Prompt(promptArgs *PromptArgs) string {
+	if promptArgs.InitialBufferText != "" {
+		readLineSetInitialBufferText(promptArgs.InitialBufferText)
+		defer readLineSetInitialBufferText("")
+	}
 
-	readLineSetupPromptHistory(prompt)
+	if promptArgs.NumCharsToRead > 0 {
+		readLineSetNumCharsToRead(promptArgs.NumCharsToRead)
+		defer readLineSetNumCharsToRead(0)
+	}
+
+	readLineSetupPromptHistory(promptArgs.Prompt)
 	readLineSetActive(true)
+	cPrompt := C.CString(promptArgs.Prompt)
 	cInput := C.readline(cPrompt)
 	readLineSetActive(false)
 
 	C.free(unsafe.Pointer(cPrompt))
-	readLineAddPromptHistory(prompt, cInput)
+	readLineAddPromptHistory(promptArgs.Prompt, cInput)
 	input := C.GoString(cInput)
 	C.free(unsafe.Pointer(cInput))
 
@@ -153,11 +203,43 @@ func ReadLineActive() bool {
 	return readLine.active
 }
 
+// CancelReadline cancels the current readline invocation
+func CancelReadline() {
+	readLine.lock.Lock()
+	defer readLine.lock.Unlock()
+
+	if readLine.active {
+		C.rl_delete_text(0, C.rl_end)
+		C.rl_done = 1
+	}
+}
+
 func readLineSetActive(active bool) {
 	readLine.lock.Lock()
 	defer readLine.lock.Unlock()
 
 	readLine.active = active
+}
+
+func readLineSetInitialBufferText(initialBufferText string) {
+	readLine.lock.Lock()
+	defer readLine.lock.Unlock()
+
+	readLine.initialBufferText = initialBufferText
+}
+
+func readLineSetNumCharsToRead(numCharsToRead int) {
+	readLine.lock.Lock()
+	defer readLine.lock.Unlock()
+
+	C.rl_num_chars_to_read = C.int(numCharsToRead)
+}
+
+func readLineStifleHistory(promptHistorySize int) {
+	readLine.lock.Lock()
+	defer readLine.lock.Unlock()
+
+	C.stifle_history(C.int(promptHistorySize))
 }
 
 func readLineSetupPromptHistory(prompt string) {
@@ -194,7 +276,7 @@ func readLineAddPromptHistory(prompt string, cInput *C.char) {
 	_, hasHistoryFile := historyFilePrompts[readLine.lastPromptText]
 
 	if hasHistoryFile {
-		C.add_history(cInput)
+		C.grv_add_history(cInput)
 	}
 }
 
@@ -215,4 +297,29 @@ func grvReadlineUpdateDisplay() {
 		readLine.promptText, readLine.promptInput, readLine.promptPoint)
 
 	readLine.channels.UpdateDisplay()
+}
+
+//export grvReadlineStartUpHook
+func grvReadlineStartUpHook() C.int {
+	readLine.lock.Lock()
+	defer readLine.lock.Unlock()
+
+	if readLine.initialBufferText != "" {
+		cInitialBufferText := C.CString(readLine.initialBufferText)
+		C.rl_insert_text(cInitialBufferText)
+		C.free(unsafe.Pointer(cInitialBufferText))
+	}
+
+	return 0
+}
+
+//export grvReadlineEventHook
+func grvReadlineEventHook() C.int {
+	return 0
+}
+
+//export grvReadlineEscapeHandler
+func grvReadlineEscapeHandler(C.int, C.int) C.int {
+	CancelReadline()
+	return 0
 }

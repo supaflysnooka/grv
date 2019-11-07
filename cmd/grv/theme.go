@@ -35,6 +35,15 @@ const (
 	CmpCommitviewTag
 	CmpCommitviewLocalBranch
 	CmpCommitviewRemoteBranch
+	CmpCommitviewGraphCommit
+	CmpCommitviewGraphMergeCommit
+	CmpCommitviewGraphBranch1
+	CmpCommitviewGraphBranch2
+	CmpCommitviewGraphBranch3
+	CmpCommitviewGraphBranch4
+	CmpCommitviewGraphBranch5
+	CmpCommitviewGraphBranch6
+	CmpCommitviewGraphBranch7
 
 	CmpDiffviewTitle
 	CmpDiffviewFooter
@@ -52,7 +61,17 @@ const (
 	CmpDiffviewDifflineHunkHeader
 	CmpDiffviewDifflineLineAdded
 	CmpDiffviewDifflineLineRemoved
+	CmpDiffviewFancyDiffLineSeparator
+	CmpDiffviewFancyDiffLineFile
+	CmpDiffviewFancyDifflineLineAdded
+	CmpDiffviewFancyDifflineLineRemoved
+	CmpDiffviewFancyDifflineLineAddedChange
+	CmpDiffviewFancyDifflineLineRemovedChange
+	CmpDiffviewFancyDifflineEmptyLineAdded
+	CmpDiffviewFancyDifflineEmptyLineRemoved
+	CmpDiffviewFancyDifflineTrailingWhitespace
 
+	CmpGitStatusMessage
 	CmpGitStatusStagedTitle
 	CmpGitStatusUnstagedTitle
 	CmpGitStatusUntrackedTitle
@@ -62,6 +81,19 @@ const (
 	CmpGitStatusUntrackedFile
 	CmpGitStatusConflictedFile
 
+	CmpHelpViewTitle
+	CmpHelpViewIndexTitle
+	CmpHelpViewIndexSubTitle
+	CmpHelpViewSectionTitle
+	CmpHelpViewSectionSubTitle
+	CmpHelpViewSectionDescription
+	CmpHelpViewSectionCodeBlock
+	CmpHelpViewSectionTableHeader
+	CmpHelpViewSectionTableRow
+	CmpHelpViewSectionTableRowHighlighted
+	CmpHelpViewSectionTableCellSeparator
+	CmpHelpViewFooter
+
 	CmpStatusbarviewNormal
 
 	CmpHelpbarviewSpecial
@@ -70,6 +102,39 @@ const (
 	CmpErrorViewTitle
 	CmpErrorViewFooter
 	CmpErrorViewErrors
+
+	CmpContextMenuTitle
+	CmpContextMenuContent
+	CmpContextMenuKeyMapping
+	CmpContextMenuFooter
+
+	CmpCommandOutputTitle
+	CmpCommandOutputCommand
+	CmpCommandOutputNormal
+	CmpCommandOutputError
+	CmpCommandOutputSuccess
+	CmpCommandOutputFooter
+
+	CmpMessageBoxTitle
+	CmpMessageBoxContent
+	CmpMessageBoxSelectedButton
+
+	CmpGRVVariableViewTitle
+	CmpGRVVariableViewVariable
+	CmpGRVVariableViewValue
+	CmpGRVVariableViewFooter
+
+	CmpRemoteViewTitle
+	CmpRemoteViewRemote
+	CmpRemoteViewFooter
+
+	CmpSummaryViewHeader
+	CmpSummaryViewNormal
+	CmpSummaryViewBranchAhead
+	CmpSummaryViewBranchBehind
+	CmpSummaryViewStagedFile
+	CmpSummaryViewUnstagedFile
+	CmpSummaryViewNoModifiedFiles
 
 	CmpCount
 )
@@ -141,10 +206,34 @@ func NewRGBColor(red, green, blue byte) ThemeColor {
 
 func (rgbColor *RGBColor) themeColor() {}
 
+// ThemeStyleType represents a type of styling applied to text
+type ThemeStyleType int
+
+// The set of supported text styles
+const (
+	TstNormal   ThemeStyleType = 0
+	TstStandout ThemeStyleType = 1 << (iota - 1)
+	TstUnderline
+	TstReverse
+	TstBlink
+	TstDim
+	TstBold
+	TstProtect
+	TstInvis
+	TstAltcharset
+	TstChartext
+)
+
+// ThemeStyle contains styles that should be applied to text
+type ThemeStyle struct {
+	styleTypes ThemeStyleType
+}
+
 // ThemeComponent stores the color information for a theme component
 type ThemeComponent struct {
 	bgcolor ThemeColor
 	fgcolor ThemeColor
+	style   ThemeStyle
 }
 
 // Theme provides read only access to the style information of a theme

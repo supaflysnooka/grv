@@ -17,13 +17,13 @@ type SearchableView interface {
 type ViewSearch struct {
 	search               *Search
 	searchableView       SearchableView
-	channels             *Channels
+	channels             Channels
 	lastSearchFoundMatch bool
 	lock                 sync.Mutex
 }
 
 // NewViewSearch creates a new instance
-func NewViewSearch(searchableView SearchableView, channels *Channels) *ViewSearch {
+func NewViewSearch(searchableView SearchableView, channels Channels) *ViewSearch {
 	return &ViewSearch{
 		searchableView: searchableView,
 		channels:       channels,
@@ -88,13 +88,13 @@ func (viewSearch *ViewSearch) findNextMatch() (err error) {
 		return
 	}
 
-	viewPos := viewSearch.searchableView.ViewPos()
-
 	viewSearch.channels.ReportStatus("Searching...")
-	log.Debugf("Searching for next occurrence of pattern %v starting from row index :%v",
-		pattern, viewPos.ActiveRowIndex())
 
 	go func() {
+		viewPos := viewSearch.searchableView.ViewPos()
+		log.Debugf("Searching for next occurrence of pattern %v starting from row index :%v",
+			pattern, viewPos.ActiveRowIndex())
+
 		matchLineIndex, found := viewSearch.search.FindNext(viewPos.ActiveRowIndex())
 
 		viewSearch.lock.Lock()
@@ -118,13 +118,13 @@ func (viewSearch *ViewSearch) findPrevMatch() (err error) {
 		return
 	}
 
-	viewPos := viewSearch.searchableView.ViewPos()
-
 	viewSearch.channels.ReportStatus("Searching...")
-	log.Debugf("Searching for previous occurrence of pattern %v starting from row index :%v",
-		pattern, viewPos.ActiveRowIndex())
 
 	go func() {
+		viewPos := viewSearch.searchableView.ViewPos()
+		log.Debugf("Searching for previous occurrence of pattern %v starting from row index :%v",
+			pattern, viewPos.ActiveRowIndex())
+
 		matchLineIndex, found := viewSearch.search.FindPrev(viewPos.ActiveRowIndex())
 
 		viewSearch.lock.Lock()

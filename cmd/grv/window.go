@@ -49,6 +49,81 @@ const (
 	AcsSterling         = AcsChar(gc.ACS_STERLING)
 )
 
+// AChar represents a video attribute
+type AChar gc.Char
+
+// The set of supported video attributes
+const (
+	Anormal     = AChar(gc.A_NORMAL)
+	Astandout   = AChar(gc.A_STANDOUT)
+	Aunderline  = AChar(gc.A_UNDERLINE)
+	Areverse    = AChar(gc.A_REVERSE)
+	Ablink      = AChar(gc.A_BLINK)
+	Adim        = AChar(gc.A_DIM)
+	Abold       = AChar(gc.A_BOLD)
+	Aprotect    = AChar(gc.A_PROTECT)
+	Ainvis      = AChar(gc.A_INVIS)
+	Aaltcharset = AChar(gc.A_ALTCHARSET)
+	Achartext   = AChar(gc.A_CHARTEXT)
+)
+
+var themeStyleMap = map[ThemeStyleType]AChar{
+	TstNormal:     Anormal,
+	TstStandout:   Astandout,
+	TstUnderline:  Aunderline,
+	TstReverse:    Areverse,
+	TstBlink:      Ablink,
+	TstDim:        Adim,
+	TstBold:       Abold,
+	TstProtect:    Aprotect,
+	TstInvis:      Ainvis,
+	TstAltcharset: Aaltcharset,
+	TstChartext:   Achartext,
+}
+
+// SelectedRowStyle specifies how the selected row is styled
+type SelectedRowStyle int
+
+// The set of supported selected row styles
+const (
+	SrsHighlight SelectedRowStyle = iota
+	SrsUnderline
+)
+
+// WindowStyleConfig is used to configure aspects of how a window is drawn
+type WindowStyleConfig interface {
+	ShowBorder() bool
+	SelectedRowStyleType() SelectedRowStyle
+}
+
+type windowStyleConfig struct {
+	showBorder       bool
+	selectedRowStyle SelectedRowStyle
+}
+
+func (styleConfig *windowStyleConfig) ShowBorder() bool {
+	return styleConfig.showBorder
+}
+
+func (styleConfig *windowStyleConfig) SelectedRowStyleType() SelectedRowStyle {
+	return styleConfig.selectedRowStyle
+}
+
+// NewWindowStyleConfig creates a new instance
+func NewWindowStyleConfig(showBorder bool, selectedRowStyle SelectedRowStyle) WindowStyleConfig {
+	return &windowStyleConfig{
+		showBorder:       showBorder,
+		selectedRowStyle: selectedRowStyle,
+	}
+}
+
+var defaultWindowStyleConfig = NewWindowStyleConfig(true, SrsHighlight)
+
+// DefaultWindowStyleConfig returns the default window style config
+func DefaultWindowStyleConfig() WindowStyleConfig {
+	return defaultWindowStyleConfig
+}
+
 // RenderWindow represents a window that will be drawn to the display
 type RenderWindow interface {
 	ID() string
@@ -57,13 +132,14 @@ type RenderWindow interface {
 	ViewDimensions() ViewDimension
 	Clear()
 	SetRow(rowIndex, startColumn uint, themeComponentID ThemeComponentID, format string, args ...interface{}) error
-	SetSelectedRow(rowIndex uint, active bool) error
+	SetSelectedRow(rowIndex uint, viewState ViewState) error
 	SetCursor(rowIndex, colIndex uint) error
 	SetTitle(themeComponentID ThemeComponentID, format string, args ...interface{}) error
 	SetFooter(themeComponentID ThemeComponentID, format string, args ...interface{}) error
 	ApplyStyle(themeComponentID ThemeComponentID)
 	Highlight(pattern string, themeComponentID ThemeComponentID) error
 	DrawBorder()
+	DrawBorderWithStyle(ThemeComponentID)
 	LineBuilder(rowIndex, startColumn uint) (*LineBuilder, error)
 }
 
@@ -108,15 +184,16 @@ type cursor struct {
 
 // Window implements the RenderWindow interface and contains all rendered data
 type Window struct {
-	id       string
-	rows     uint
-	cols     uint
-	lines    []*line
-	startRow uint
-	startCol uint
-	border   bool
-	config   Config
-	cursor   *cursor
+	id          string
+	rows        uint
+	cols        uint
+	lines       []*line
+	startRow    uint
+	startCol    uint
+	border      bool
+	config      Config
+	cursor      *cursor
+	styleConfig WindowStyleConfig
 }
 
 func newLine(cols uint) *line {
@@ -158,10 +235,15 @@ func (lineBuilder *LineBuilder) Append(format string, args ...interface{}) *Line
 
 // AppendWithStyle adds the provided text with style information to the end of the line
 func (lineBuilder *LineBuilder) AppendWithStyle(themeComponentID ThemeComponentID, format string, args ...interface{}) *LineBuilder {
-	str := fmt.Sprintf(format, args...)
 	line := lineBuilder.line
+	var text string
+	if len(args) > 0 {
+		text = fmt.Sprintf(format, args...)
+	} else {
+		text = format
+	}
 
-	for _, codePoint := range str {
+	for _, codePoint := range text {
 		renderedCodePoints := DetermineRenderedCodePoint(codePoint, lineBuilder.column, lineBuilder.config)
 
 		for _, renderedCodePoint := range renderedCodePoints {
@@ -193,6 +275,7 @@ func (lineBuilder *LineBuilder) AppendACSChar(acsChar AcsChar, themeComponentID 
 			cell.codePoints.Reset()
 			cell.style.themeComponentID = themeComponentID
 			cell.style.acsChar = gc.Char(acsChar)
+			lineBuilder.applyStyle(cell, themeComponentID)
 			lineBuilder.cellIndex++
 		}
 
@@ -212,10 +295,26 @@ func (lineBuilder *LineBuilder) setCellAndAdvanceIndex(codePoint rune, width uin
 			cell.codePoints.WriteRune(codePoint)
 			cell.style.themeComponentID = themeComponentID
 			cell.style.acsChar = 0
+			lineBuilder.applyStyle(cell, themeComponentID)
 			lineBuilder.cellIndex++
 		}
 
 		lineBuilder.column += width
+	}
+}
+
+func (lineBuilder *LineBuilder) applyStyle(cell *cell, themeComponentID ThemeComponentID) {
+	theme := lineBuilder.config.GetTheme()
+	themeComponent := theme.GetComponent(themeComponentID)
+
+	if themeComponent.style.styleTypes == TstNormal {
+		return
+	}
+
+	for styleType, aChar := range themeStyleMap {
+		if themeComponent.style.styleTypes&styleType != TstNormal {
+			cell.style.attr |= gc.Char(aChar)
+		}
 	}
 }
 
@@ -244,9 +343,15 @@ func (lineBuilder *LineBuilder) appendToPreviousCell(codePoint rune) {
 
 // NewWindow creates a new instance
 func NewWindow(id string, config Config) *Window {
+	return NewWindowWithStyleConfig(id, config, defaultWindowStyleConfig)
+}
+
+// NewWindowWithStyleConfig creates a new instance with the provided window style config
+func NewWindowWithStyleConfig(id string, config Config, styleConfig WindowStyleConfig) *Window {
 	return &Window{
-		id:     id,
-		config: config,
+		id:          id,
+		config:      config,
+		styleConfig: styleConfig,
 	}
 }
 
@@ -274,6 +379,11 @@ func (win *Window) SetPosition(startRow, startCol uint) {
 	win.startCol = startCol
 }
 
+// Position returns the coordintates the window is displayed at
+func (win *Window) Position() (startRow, startCol uint) {
+	return win.startRow, win.startCol
+}
+
 // OffsetPosition applies the provided offsets to the windows position
 func (win *Window) OffsetPosition(rowOffset, colOffset int) {
 	win.startRow = applyOffset(win.startRow, rowOffset)
@@ -282,7 +392,7 @@ func (win *Window) OffsetPosition(rowOffset, colOffset int) {
 
 func applyOffset(value uint, offset int) uint {
 	if offset < 0 {
-		return value - MinUint(value, Abs(offset))
+		return value - MinUInt(value, Abs(offset))
 	}
 
 	return value + uint(offset)
@@ -313,7 +423,7 @@ func (win *Window) ViewDimensions() ViewDimension {
 
 // Clear resets all cells in the window
 func (win *Window) Clear() {
-	log.Debugf("Clearing window %v", win.id)
+	log.Tracef("Clearing window %v", win.id)
 
 	for _, line := range win.lines {
 		for _, cell := range line.cells {
@@ -353,13 +463,27 @@ func (win *Window) SetRow(rowIndex, startColumn uint, themeComponentID ThemeComp
 }
 
 // SetSelectedRow sets the row to be highlighted as the selected row
-func (win *Window) SetSelectedRow(rowIndex uint, active bool) error {
-	log.Debugf("Set selected rowIndex for window %v to %v with active %v", win.id, rowIndex, active)
+func (win *Window) SetSelectedRow(rowIndex uint, viewState ViewState) (err error) {
+	active := viewState == ViewStateActive
+	log.Tracef("Set selected rowIndex for window %v to %v with active %v", win.id, rowIndex, active)
 
 	if rowIndex >= win.rows {
 		return fmt.Errorf("SetSelectedRow: Invalid row index: %v >= %v rows", rowIndex, win.rows)
 	}
 
+	switch win.styleConfig.SelectedRowStyleType() {
+	case SrsHighlight:
+		win.highlightSelectedRow(rowIndex, active)
+	case SrsUnderline:
+		win.underlineSelectedRow(rowIndex, active)
+	default:
+		log.Errorf("Unsupported SelectedRowStyle: %v", win.styleConfig.SelectedRowStyleType())
+	}
+
+	return
+}
+
+func (win *Window) highlightSelectedRow(rowIndex uint, active bool) {
 	var attr gc.Char = gc.A_REVERSE
 	var themeComponentID ThemeComponentID
 
@@ -376,8 +500,41 @@ func (win *Window) SetSelectedRow(rowIndex uint, active bool) error {
 		cell.style.attr |= attr
 		cell.style.themeComponentID = themeComponentID
 	}
+}
 
-	return nil
+func (win *Window) underlineSelectedRow(rowIndex uint, active bool) {
+	if !active {
+		return
+	}
+
+	line := win.lines[rowIndex]
+
+	firstNonBlackCellIndex := 0
+	lastNonBlankCellIndex := 0
+
+	for cellIndex, cell := range line.cells {
+		if cell.codePoints.String() != " " {
+			firstNonBlackCellIndex = cellIndex
+			break
+		}
+	}
+
+	for cellIndex := firstNonBlackCellIndex + 1; cellIndex < len(line.cells); cellIndex++ {
+		cell := line.cells[cellIndex]
+		if cell.codePoints.String() != " " {
+			lastNonBlankCellIndex = cellIndex
+		}
+	}
+
+	if firstNonBlackCellIndex > lastNonBlankCellIndex {
+		lastNonBlankCellIndex = firstNonBlackCellIndex
+	}
+
+	for cellIndex := firstNonBlackCellIndex; cellIndex <= lastNonBlankCellIndex; cellIndex++ {
+		cell := line.cells[cellIndex]
+		cell.style.attr |= gc.A_BOLD | gc.A_UNDERLINE
+		cell.style.themeComponentID = CmpAllviewActiveViewSelectedRow
+	}
 }
 
 // IsCursorSet returns true if a cursor position has been set
@@ -418,7 +575,9 @@ func (win *Window) SetFooter(themeComponentID ThemeComponentID, format string, a
 }
 
 func (win *Window) setHeader(rowIndex uint, rightJustified bool, themeComponentID ThemeComponentID, format string, args ...interface{}) (err error) {
-	if win.rows < 3 || win.cols < 3 {
+	if !win.styleConfig.ShowBorder() {
+		return
+	} else if win.rows < 3 || win.cols < 3 {
 		log.Errorf("Can't set header on window %v with %v rows and %v cols", win.id, win.rows, win.cols)
 		return
 	}
@@ -454,27 +613,35 @@ func (win *Window) setHeader(rowIndex uint, rightJustified bool, themeComponentI
 
 // DrawBorder draws a line of a single cells width around the edge of the window
 func (win *Window) DrawBorder() {
-	if win.rows < 3 || win.cols < 3 {
+	win.DrawBorderWithStyle(CmpNone)
+}
+
+// DrawBorderWithStyle draws a line of a single cells width around the edge of the window
+// using the style provided
+func (win *Window) DrawBorderWithStyle(themeComponentID ThemeComponentID) {
+	if !win.styleConfig.ShowBorder() {
+		return
+	} else if win.rows < 3 || win.cols < 3 {
 		return
 	}
 
 	firstLine := win.lines[0]
 	firstLine.cells[0].setStyle(cellStyle{
-		themeComponentID: CmpNone,
+		themeComponentID: themeComponentID,
 		acsChar:          gc.ACS_ULCORNER,
 		attr:             gc.A_NORMAL,
 	})
 
 	for i := uint(1); i < win.cols-1; i++ {
 		firstLine.cells[i].setStyle(cellStyle{
-			themeComponentID: CmpNone,
+			themeComponentID: themeComponentID,
 			acsChar:          gc.ACS_HLINE,
 			attr:             gc.A_NORMAL,
 		})
 	}
 
 	firstLine.cells[win.cols-1].setStyle(cellStyle{
-		themeComponentID: CmpNone,
+		themeComponentID: themeComponentID,
 		acsChar:          gc.ACS_URCORNER,
 		attr:             gc.A_NORMAL,
 	})
@@ -482,12 +649,12 @@ func (win *Window) DrawBorder() {
 	for i := uint(1); i < win.rows-1; i++ {
 		line := win.lines[i]
 		line.cells[0].setStyle(cellStyle{
-			themeComponentID: CmpNone,
+			themeComponentID: themeComponentID,
 			acsChar:          gc.ACS_VLINE,
 			attr:             gc.A_NORMAL,
 		})
 		line.cells[win.cols-1].setStyle(cellStyle{
-			themeComponentID: CmpNone,
+			themeComponentID: themeComponentID,
 			acsChar:          gc.ACS_VLINE,
 			attr:             gc.A_NORMAL,
 		})
@@ -495,21 +662,21 @@ func (win *Window) DrawBorder() {
 
 	lastLine := win.lines[win.rows-1]
 	lastLine.cells[0].setStyle(cellStyle{
-		themeComponentID: CmpNone,
+		themeComponentID: themeComponentID,
 		acsChar:          gc.ACS_LLCORNER,
 		attr:             gc.A_NORMAL,
 	})
 
 	for i := uint(1); i < win.cols-1; i++ {
 		lastLine.cells[i].setStyle(cellStyle{
-			themeComponentID: CmpNone,
+			themeComponentID: themeComponentID,
 			acsChar:          gc.ACS_HLINE,
 			attr:             gc.A_NORMAL,
 		})
 	}
 
 	lastLine.cells[win.cols-1].setStyle(cellStyle{
-		themeComponentID: CmpNone,
+		themeComponentID: themeComponentID,
 		acsChar:          gc.ACS_LRCORNER,
 		attr:             gc.A_NORMAL,
 	})

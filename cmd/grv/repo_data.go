@@ -2,8 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"reflect"
 	"sync"
 
@@ -12,18 +10,19 @@ import (
 )
 
 const (
-	// GitRepositoryDirectoryName is the name of the git directory in a git repository
-	GitRepositoryDirectoryName = ".git"
-	updatedRefChannelSize      = 256
+	updatedRefChannelSize = 256
 )
 
 // OnRefsLoaded is called when all refs have been loaded and processed
 type OnRefsLoaded func([]Ref) error
 
+// ReloadResult is called when a reload of cached repository data has been completed
+type ReloadResult func(err error)
+
 // CommitSetListener is notified of load and update events for commit sets
 type CommitSetListener interface {
 	OnCommitsLoaded(Ref)
-	OnCommitsUpdated(ref Ref)
+	OnCommitsUpdated(Ref)
 }
 
 // StatusListener is notified when git status has changed
@@ -54,6 +53,11 @@ type RefStateListener interface {
 type RepoData interface {
 	EventListener
 	Path() string
+	RepositoryRootPath() string
+	Workdir() string
+	UserEditor() (string, error)
+	GenerateGitCommandEnvironment() (env []string, rootDir string)
+	Reload(ReloadResult)
 	LoadHead() error
 	LoadRefs(OnRefsLoaded)
 	LoadCommits(Ref) error
@@ -61,12 +65,14 @@ type RepoData interface {
 	Ref(refName string) (Ref, error)
 	Branches() (localBranches, remoteBranches []Branch, loading bool)
 	Tags() (tags []*Tag, loading bool)
+	LocalBranches(*RemoteBranch) []*LocalBranch
 	RefsForCommit(*Commit) *CommitRefs
 	CommitSetState(Ref) CommitSetState
 	Commits(ref Ref, startIndex, count uint) (<-chan *Commit, error)
 	CommitByIndex(ref Ref, index uint) (*Commit, error)
 	Commit(oid *Oid) (*Commit, error)
 	CommitByOid(oidStr string) (*Commit, error)
+	CommitParents(oid *Oid) ([]*Commit, error)
 	AddCommitFilter(Ref, *CommitFilter) error
 	RemoveCommitFilter(Ref) error
 	DiffCommit(commit *Commit) (*Diff, error)
@@ -74,6 +80,8 @@ type RepoData interface {
 	DiffStage(statusType StatusType) (*Diff, error)
 	LoadStatus() (err error)
 	Status() *Status
+	LoadRemotes() error
+	Remotes() []string
 	RegisterStatusListener(StatusListener)
 	RegisterRefStateListener(RefStateListener)
 	RegisterCommitSetListener(CommitSetListener)
@@ -358,6 +366,14 @@ func (refSet *refSet) unregisterRefStateListener(refStateListener RefStateListen
 func (refSet *refSet) updateHead(head Ref) {
 	refSet.lock.Lock()
 	defer refSet.lock.Unlock()
+
+	if branch, isLocalBranch := head.(*LocalBranch); isLocalBranch {
+		if branchRef, ok := refSet.refs[branch.Name()]; ok {
+			if branch.Oid().Equal(branchRef.Oid()) {
+				head = branchRef
+			}
+		}
+	}
 
 	oldHead := refSet.headRef
 	refSet.headRef = head
@@ -652,6 +668,23 @@ func (refSet *refSet) tags() (tagsList []*Tag, loading bool) {
 	return
 }
 
+func (refSet *refSet) localBranches(remoteBranch *RemoteBranch) (localBranches []*LocalBranch) {
+	refSet.lock.Lock()
+	defer refSet.lock.Unlock()
+
+	localBranchNames, exist := refSet.remoteToLocalTrackingBranches[remoteBranch.Name()]
+	if !exist {
+		return
+	}
+
+	for localBranchName := range localBranchNames {
+		localBranch := refSet.refs[localBranchName].(*LocalBranch)
+		localBranches = append(localBranches, localBranch)
+	}
+
+	return
+}
+
 // CommitRefs contain all refs to a commit
 type CommitRefs struct {
 	tags     []*Tag
@@ -676,14 +709,14 @@ func (commitRefSet *commitRefSet) clear() {
 	commitRefSet.commitRefs = make(map[*Oid]*CommitRefs)
 }
 
-func (commitRefSet *commitRefSet) addTagForCommit(commit *Commit, newTag *Tag) {
+func (commitRefSet *commitRefSet) addTagForCommit(oid *Oid, newTag *Tag) {
 	commitRefSet.lock.Lock()
 	defer commitRefSet.lock.Unlock()
 
-	commitRefs, ok := commitRefSet.commitRefs[commit.oid]
+	commitRefs, ok := commitRefSet.commitRefs[oid]
 	if !ok {
 		commitRefs = &CommitRefs{}
-		commitRefSet.commitRefs[commit.oid] = commitRefs
+		commitRefSet.commitRefs[oid] = commitRefs
 	}
 
 	for _, tag := range commitRefs.tags {
@@ -695,14 +728,14 @@ func (commitRefSet *commitRefSet) addTagForCommit(commit *Commit, newTag *Tag) {
 	commitRefs.tags = append(commitRefs.tags, newTag)
 }
 
-func (commitRefSet *commitRefSet) addBranchForCommit(commit *Commit, newBranch Branch) {
+func (commitRefSet *commitRefSet) addBranchForCommit(oid *Oid, newBranch Branch) {
 	commitRefSet.lock.Lock()
 	defer commitRefSet.lock.Unlock()
 
-	commitRefs, ok := commitRefSet.commitRefs[commit.oid]
+	commitRefs, ok := commitRefSet.commitRefs[oid]
 	if !ok {
 		commitRefs = &CommitRefs{}
-		commitRefSet.commitRefs[commit.oid] = commitRefs
+		commitRefSet.commitRefs[oid] = commitRefs
 	}
 
 	for _, branch := range commitRefs.branches {
@@ -714,13 +747,13 @@ func (commitRefSet *commitRefSet) addBranchForCommit(commit *Commit, newBranch B
 	commitRefs.branches = append(commitRefs.branches, newBranch)
 }
 
-func (commitRefSet *commitRefSet) refsForCommit(commit *Commit) (commitRefsCopy *CommitRefs) {
+func (commitRefSet *commitRefSet) refsForCommit(oid *Oid) (commitRefsCopy *CommitRefs) {
 	commitRefSet.lock.Lock()
 	defer commitRefSet.lock.Unlock()
 
 	commitRefsCopy = &CommitRefs{}
 
-	commitRefs, ok := commitRefSet.commitRefs[commit.oid]
+	commitRefs, ok := commitRefSet.commitRefs[oid]
 	if ok {
 		commitRefsCopy.tags = append([]*Tag(nil), commitRefs.tags...)
 		commitRefsCopy.branches = append([]Branch(nil), commitRefs.branches...)
@@ -732,11 +765,11 @@ func (commitRefSet *commitRefSet) refsForCommit(commit *Commit) (commitRefsCopy 
 type refCommitSets struct {
 	commits            map[string]commitSet
 	commitSetListeners []CommitSetListener
-	channels           *Channels
+	channels           Channels
 	lock               sync.Mutex
 }
 
-func newRefCommitSets(channels *Channels) *refCommitSets {
+func newRefCommitSets(channels Channels) *refCommitSets {
 	return &refCommitSets{
 		commits:  make(map[string]commitSet),
 		channels: channels,
@@ -905,9 +938,12 @@ func (statusManager *statusManager) loadStatus() (err error) {
 		log.Debugf("Git status has changed. Notifying status listeners.")
 		statusManager.status = newStatus
 
-		for _, statusListener := range statusManager.statusListeners {
-			statusListener.OnStatusChanged(newStatus)
-		}
+		statusListeners := append([]StatusListener(nil), statusManager.statusListeners...)
+		go func() {
+			for _, statusListener := range statusListeners {
+				statusListener.OnStatusChanged(newStatus)
+			}
+		}()
 	}
 
 	return
@@ -951,9 +987,32 @@ func (statusManager *statusManager) unregisterStatusListener(statusListener Stat
 	}
 }
 
+type remoteSet struct {
+	remotes []string
+	lock    sync.Mutex
+}
+
+func newRemoteSet() *remoteSet {
+	return &remoteSet{}
+}
+
+func (remoteSet *remoteSet) setRemotes(remotes []string) {
+	remoteSet.lock.Lock()
+	defer remoteSet.lock.Unlock()
+
+	remoteSet.remotes = remotes
+}
+
+func (remoteSet *remoteSet) getRemotes() []string {
+	remoteSet.lock.Lock()
+	defer remoteSet.lock.Unlock()
+
+	return remoteSet.remotes
+}
+
 // RepositoryData implements RepoData and stores all loaded repository data
 type RepositoryData struct {
-	channels       *Channels
+	channels       Channels
 	repoDataLoader *RepoDataLoader
 	head           Ref
 	refSet         *refSet
@@ -961,10 +1020,13 @@ type RepositoryData struct {
 	refCommitSets  *refCommitSets
 	statusManager  *statusManager
 	refUpdateCh    chan *UpdatedRef
+	variables      *GRVVariables
+	remoteSet      *remoteSet
+	waitGroup      sync.WaitGroup
 }
 
 // NewRepositoryData creates a new instance
-func NewRepositoryData(repoDataLoader *RepoDataLoader, channels *Channels) *RepositoryData {
+func NewRepositoryData(repoDataLoader *RepoDataLoader, channels Channels, variables *GRVVariables) *RepositoryData {
 	repoData := &RepositoryData{
 		channels:       channels,
 		repoDataLoader: repoDataLoader,
@@ -972,6 +1034,8 @@ func NewRepositoryData(repoDataLoader *RepoDataLoader, channels *Channels) *Repo
 		refCommitSets:  newRefCommitSets(channels),
 		statusManager:  newStatusManager(repoDataLoader),
 		refUpdateCh:    make(chan *UpdatedRef, updatedRefChannelSize),
+		variables:      variables,
+		remoteSet:      newRemoteSet(),
 	}
 
 	repoData.refSet = newRefSet(repoData)
@@ -982,72 +1046,76 @@ func NewRepositoryData(repoDataLoader *RepoDataLoader, channels *Channels) *Repo
 // Free free's any underlying resources
 func (repoData *RepositoryData) Free() {
 	close(repoData.refUpdateCh)
-	repoData.repoDataLoader.Free()
+	repoData.refUpdateCh = nil
+	repoData.waitGroup.Wait()
 }
 
 // Initialise performs setup to allow loading data from the repository
-func (repoData *RepositoryData) Initialise(repoPath, workTreePath string) (err error) {
-	repoPath, err = repoData.processRepoPath(repoPath)
-	if err != nil {
-		return
-	}
-	workTreePath = repoData.processWorkTreePath(workTreePath)
+func (repoData *RepositoryData) Initialise(repoSupplier RepoSupplier) (err error) {
+	repoData.repoDataLoader.Initialise(repoSupplier)
 
-	if err = repoData.repoDataLoader.Initialise(repoPath, workTreePath); err != nil {
-		return
-	}
+	repoData.variables.SetVariable(VarRepoPath, repoData.Path())
+	repoData.variables.SetVariable(VarRepoWorkDir, repoData.Workdir())
 
+	repoData.waitGroup.Add(1)
 	go repoData.processUpdatedRefs()
 	repoData.RegisterRefStateListener(repoData)
 
-	return repoData.LoadStatus()
+	return repoData.LoadHead()
 }
 
-func (repoData *RepositoryData) processRepoPath(repoPath string) (processedRepoPath string, err error) {
-	if gitDir, gitDirSet := os.LookupEnv("GIT_DIR"); gitDirSet {
-		return gitDir, nil
-	}
-
-	path, err := CanonicalPath(repoPath)
-	if err != nil {
-		return
-	}
-
-	for {
-		gitDirPath := filepath.Join(path, GitRepositoryDirectoryName)
-		log.Debugf("gitDirPath: %v", gitDirPath)
-
-		if _, err = os.Stat(gitDirPath); err != nil {
-			if !os.IsNotExist(err) {
-				break
-			}
-		} else {
-			processedRepoPath = gitDirPath
-			break
-		}
-
-		if path == "/" {
-			err = fmt.Errorf("Unable to find a git repository in %v or any of its parent directories", repoPath)
-			break
-		}
-
-		path = filepath.Dir(path)
-	}
-
-	return
-}
-
-func (repoData *RepositoryData) processWorkTreePath(workTreePath string) string {
-	if gitWorkTree, gitWorkTreeSet := os.LookupEnv("GIT_WORK_TREE"); gitWorkTreeSet {
-		return gitWorkTree
-	}
-
-	return workTreePath
-}
-
-// Path returns the file patch location of the repository
+// Path returns the file path location of the repository
 func (repoData *RepositoryData) Path() string {
 	return repoData.repoDataLoader.Path()
+}
+
+// RepositoryRootPath returns the root working directory of the repository
+func (repoData *RepositoryData) RepositoryRootPath() string {
+	_, rootDir := repoData.GenerateGitCommandEnvironment()
+	return rootDir
+}
+
+// Workdir returns working directory file path for the repository
+func (repoData *RepositoryData) Workdir() string {
+	return repoData.repoDataLoader.Workdir()
+}
+
+// UserEditor returns the editor git is configured to use
+func (repoData *RepositoryData) UserEditor() (string, error) {
+	return repoData.repoDataLoader.UserEditor()
+}
+
+// Reload cached repository data
+func (repoData *RepositoryData) Reload(reloadResult ReloadResult) {
+	notifyResult := func(err error) {
+		if reloadResult != nil {
+			reloadResult(err)
+		}
+	}
+
+	go func() {
+		if repoData.refSet.startRefUpdate() {
+			err := repoData.loadRefs(nil)
+			repoData.refSet.endRefUpdate()
+
+			if err != nil {
+				notifyResult(err)
+				return
+			}
+		}
+
+		if err := repoData.LoadStatus(); err != nil {
+			notifyResult(err)
+			return
+		}
+
+		if err := repoData.LoadRemotes(); err != nil {
+			notifyResult(err)
+			return
+		}
+
+		notifyResult(nil)
+	}()
 }
 
 // LoadHead attempts to load the HEAD reference
@@ -1058,6 +1126,12 @@ func (repoData *RepositoryData) LoadHead() (err error) {
 	}
 
 	repoData.refSet.updateHead(head)
+
+	if _, isDetached := head.(*HEAD); isDetached {
+		repoData.variables.SetVariable(VarHead, head.Oid().String())
+	} else {
+		repoData.variables.SetVariable(VarHead, head.Name())
+	}
 
 	return
 }
@@ -1075,35 +1149,36 @@ func (repoData *RepositoryData) LoadRefs(onRefsLoaded OnRefsLoaded) {
 
 	go func() {
 		defer refSet.endRefUpdate()
-
-		if err := repoData.LoadHead(); err != nil {
+		if err := repoData.loadRefs(onRefsLoaded); err != nil {
 			repoData.channels.ReportError(err)
-			return
-		}
-
-		refs, err := repoData.repoDataLoader.LoadRefs()
-		if err != nil {
-			repoData.channels.ReportError(err)
-			return
-		}
-
-		repoData.mapRefsToCommits(refs)
-
-		if err = refSet.updateRefs(refs); err != nil {
-			repoData.channels.ReportError(err)
-			return
-		}
-
-		refSet.endRefUpdate()
-
-		log.Debug("Refs loaded")
-
-		if onRefsLoaded != nil {
-			if err = onRefsLoaded(refs); err != nil {
-				repoData.channels.ReportError(err)
-			}
 		}
 	}()
+}
+
+func (repoData *RepositoryData) loadRefs(onRefsLoaded OnRefsLoaded) (err error) {
+	refs, err := repoData.repoDataLoader.LoadRefs()
+	if err != nil {
+		return
+	}
+
+	if err = repoData.refSet.updateRefs(refs); err != nil {
+		return
+	}
+
+	if err = repoData.LoadHead(); err != nil {
+		return
+	}
+
+	log.Debug("Refs loaded")
+
+	if onRefsLoaded != nil {
+		err = onRefsLoaded(refs)
+	}
+
+	repoData.mapRefsToCommits(refs)
+	repoData.channels.UpdateDisplay()
+
+	return
 }
 
 // TODO Become RefStateListener and only update commitRefSet for refs that have changed
@@ -1114,17 +1189,15 @@ func (repoData *RepositoryData) mapRefsToCommits(refs []Ref) {
 	commitRefSet.clear()
 
 	for _, ref := range refs {
-		commit, err := repoData.repoDataLoader.Commit(ref.Oid())
-		if err != nil {
-			log.Errorf("Error when loading ref %v:%v - %v", ref.Name(), ref.Oid(), err)
-			continue
-		}
-
 		switch refInstance := ref.(type) {
 		case Branch:
-			commitRefSet.addBranchForCommit(commit, refInstance)
+			commitRefSet.addBranchForCommit(ref.Oid(), refInstance)
 		case *Tag:
-			commitRefSet.addTagForCommit(commit, refInstance)
+			if commit, err := repoData.repoDataLoader.Commit(ref.Oid()); err != nil {
+				log.Errorf("Unable to load commit for tag: %v", ref.Name())
+			} else {
+				commitRefSet.addTagForCommit(commit.oid, refInstance)
+			}
 		}
 	}
 
@@ -1203,9 +1276,14 @@ func (repoData *RepositoryData) Tags() (tags []*Tag, loading bool) {
 	return repoData.refSet.tags()
 }
 
+// LocalBranches returns all local tracking branches for the provided remote branch
+func (repoData *RepositoryData) LocalBranches(remoteBranch *RemoteBranch) []*LocalBranch {
+	return repoData.refSet.localBranches(remoteBranch)
+}
+
 // RefsForCommit returns the set of all refs that point to the provided commit
 func (repoData *RepositoryData) RefsForCommit(commit *Commit) *CommitRefs {
-	return repoData.commitRefSet.refsForCommit(commit)
+	return repoData.commitRefSet.refsForCommit(commit.oid)
 }
 
 // CommitSetState returns the current commit set state for the provided oid
@@ -1276,6 +1354,29 @@ func (repoData *RepositoryData) CommitByOid(oidStr string) (*Commit, error) {
 	return repoData.repoDataLoader.CommitByOid(oidStr)
 }
 
+// CommitParents loads the parents of a commit
+func (repoData *RepositoryData) CommitParents(oid *Oid) (parentCommits []*Commit, err error) {
+	commit, err := repoData.repoDataLoader.Commit(oid)
+	if err != nil {
+		return
+	}
+
+	parentCount := commit.commit.ParentCount()
+	var parentCommit *Commit
+
+	for i := uint(0); i < parentCount; i++ {
+		parentOid := &Oid{commit.commit.ParentId(i)}
+		parentCommit, err = repoData.Commit(parentOid)
+		if err != nil {
+			return
+		}
+
+		parentCommits = append(parentCommits, parentCommit)
+	}
+
+	return
+}
+
 // AddCommitFilter adds the filter to the specified ref
 func (repoData *RepositoryData) AddCommitFilter(ref Ref, commitFilter *CommitFilter) error {
 	return repoData.refCommitSets.addCommitFilter(ref, commitFilter)
@@ -1314,6 +1415,22 @@ func (repoData *RepositoryData) Status() *Status {
 	return repoData.statusManager.getStatus()
 }
 
+// LoadRemotes loads remotes for the repository
+func (repoData *RepositoryData) LoadRemotes() (err error) {
+	remotes, err := repoData.repoDataLoader.Remotes()
+	if err != nil {
+		return
+	}
+
+	repoData.remoteSet.setRemotes(remotes)
+	return
+}
+
+// Remotes returns remotes for the repository
+func (repoData *RepositoryData) Remotes() []string {
+	return repoData.remoteSet.getRemotes()
+}
+
 // RegisterStatusListener registers a listener to be notified when git status changes
 func (repoData *RepositoryData) RegisterStatusListener(statusListener StatusListener) {
 	repoData.statusManager.registerStatusListener(statusListener)
@@ -1345,9 +1462,14 @@ func (repoData *RepositoryData) OnRefsChanged(addedRefs, removedRefs []Ref, upda
 }
 
 func (repoData *RepositoryData) addUpdatedRefsToProcessingQueue(updatedRefs []*UpdatedRef) {
+	refUpdateCh := repoData.refUpdateCh
+	if refUpdateCh == nil {
+		return
+	}
+
 	for _, updatedRef := range updatedRefs {
 		select {
-		case repoData.refUpdateCh <- updatedRef:
+		case refUpdateCh <- updatedRef:
 		default:
 			log.Errorf("Unable process UpdatedRef %v", updatedRef)
 		}
@@ -1355,6 +1477,7 @@ func (repoData *RepositoryData) addUpdatedRefsToProcessingQueue(updatedRefs []*U
 }
 
 func (repoData *RepositoryData) processUpdatedRefs() {
+	defer repoData.waitGroup.Done()
 	log.Info("Starting UpdatedRef processor")
 
 	for updatedRef := range repoData.refUpdateCh {
@@ -1439,4 +1562,10 @@ func (repoData *RepositoryData) handleViewRemovedEvent(event Event) {
 			repoData.refCommitSets.unregisterCommitSetListener(commitSetListener)
 		}
 	}
+}
+
+// GenerateGitCommandEnvironment populates git environment variables for
+// the current repository
+func (repoData *RepositoryData) GenerateGitCommandEnvironment() (env []string, rootDir string) {
+	return repoData.repoDataLoader.GenerateGitCommandEnvironment()
 }

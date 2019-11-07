@@ -24,6 +24,21 @@ func (keyBindings *MockKeyBindings) SetKeystringBinding(viewID ViewID, keystring
 	keyBindings.Called(viewID, keystring, mappedKeystring)
 }
 
+func (keyBindings *MockKeyBindings) RemoveBinding(viewID ViewID, keystring string) (removed bool) {
+	args := keyBindings.Called(viewID, keystring)
+	return args.Bool(0)
+}
+
+func (keyBindings *MockKeyBindings) KeyStrings(actionType ActionType, viewID ViewID) []BoundKeyString {
+	args := keyBindings.Called(actionType, viewID)
+	return args.Get(0).([]BoundKeyString)
+}
+
+func (keyBindings *MockKeyBindings) GenerateHelpSections(config Config) []*HelpSection {
+	args := keyBindings.Called(config)
+	return args.Get(0).([]*HelpSection)
+}
+
 func checkProcessResult(expectedAction Action, expectedKeystring string, actualAction Action, actualKeystring string, t *testing.T) {
 	if !reflect.DeepEqual(expectedAction, actualAction) {
 		t.Errorf("Returned action does not match expected value. Expected: %v, Actual: %v", expectedAction, actualAction)
@@ -114,4 +129,67 @@ func TestPotentialPrefixMatchIsReturnedAsSeparateKeysWhenFullInputDoesNotMatchBi
 
 	action, keyString = inputBuffer.Process(viewHierarchy)
 	checkProcessResult(Action{ActionType: ActionNone}, "b", action, keyString, t)
+}
+
+func TestDiscardToOnlyDiscardsInputUntilProvidedKey(t *testing.T) {
+	keyBindings := &MockKeyBindings{}
+	inputBuffer := NewInputBuffer(keyBindings)
+
+	inputBuffer.Append(`<grv-filter-prompt>committername="John Smith"<Enter><Tab>`)
+
+	discarded, enterFound := inputBuffer.DiscardTo("<Enter>")
+	hasInput := inputBuffer.hasInput()
+
+	expectedDiscarded := `<grv-filter-prompt>committername="John Smith"<Enter>`
+
+	if discarded != expectedDiscarded {
+		t.Errorf(`Discarded text "%v" does not match expected "%v"`, discarded, expectedDiscarded)
+	}
+
+	if !enterFound {
+		t.Errorf("Expected enterFound to be true")
+	}
+
+	if !hasInput {
+		t.Errorf("InputBuffer is empty")
+	}
+}
+
+func TestDiscardToDiscardsAllInputWhenTargetKeyIsNotPresent(t *testing.T) {
+	keyBindings := &MockKeyBindings{}
+	inputBuffer := NewInputBuffer(keyBindings)
+
+	inputBuffer.Append(`<grv-filter-prompt>committername="John Smith"`)
+
+	discarded, enterFound := inputBuffer.DiscardTo("<Enter>")
+	hasInput := inputBuffer.hasInput()
+
+	expectedDiscarded := `<grv-filter-prompt>committername="John Smith"`
+
+	if discarded != expectedDiscarded {
+		t.Errorf(`Discarded text "%v" does not match expected "%v"`, discarded, expectedDiscarded)
+	}
+
+	if enterFound {
+		t.Errorf("Expected enterFound to be false")
+	}
+
+	if hasInput {
+		t.Errorf("InputBuffer is not empty")
+	}
+}
+
+func TestDiscardToReturnsEmptyStringWhenInputBufferIsEmpty(t *testing.T) {
+	keyBindings := &MockKeyBindings{}
+	inputBuffer := NewInputBuffer(keyBindings)
+
+	discarded, enterFound := inputBuffer.DiscardTo("<Enter>")
+
+	if discarded != "" {
+		t.Errorf(`Discarded text "%v" does not match expected "%v"`, discarded, "")
+	}
+
+	if enterFound {
+		t.Errorf("Expected enterFound to be false")
+	}
 }

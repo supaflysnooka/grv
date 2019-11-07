@@ -10,19 +10,23 @@ import (
 // WindowViewFactory provides a generic interface
 // for creating view instances
 type WindowViewFactory struct {
-	repoData RepoData
-	channels *Channels
-	config   Config
+	repoData       RepoData
+	repoController RepoController
+	channels       Channels
+	config         Config
+	variables      GRVVariableSetter
 }
 
 var hexRegexp = regexp.MustCompile(`^[[:xdigit:]]+$`)
 
 // NewWindowViewFactory creates a new instance
-func NewWindowViewFactory(repoData RepoData, channels *Channels, config Config) *WindowViewFactory {
+func NewWindowViewFactory(repoData RepoData, repoController RepoController, channels Channels, config Config, variables GRVVariableSetter) *WindowViewFactory {
 	return &WindowViewFactory{
-		repoData: repoData,
-		channels: channels,
-		config:   config,
+		repoData:       repoData,
+		repoController: repoController,
+		channels:       channels,
+		config:         config,
+		variables:      variables,
 	}
 }
 
@@ -42,6 +46,10 @@ func (windowViewFactory *WindowViewFactory) CreateWindowViewWithArgs(viewID View
 		windowView, err = windowViewFactory.createDiffView(args)
 	case ViewGitStatus:
 		windowView = windowViewFactory.createGitStatusView()
+	case ViewGRVVariable:
+		windowView = windowViewFactory.createGRVVariableView()
+	case ViewRemote:
+		windowView = windowViewFactory.createRemoteView()
 	default:
 		err = fmt.Errorf("Unsupported view type: %v", viewID)
 	}
@@ -51,7 +59,8 @@ func (windowViewFactory *WindowViewFactory) CreateWindowViewWithArgs(viewID View
 
 func (windowViewFactory *WindowViewFactory) createRefView() *RefView {
 	log.Info("Created RefView instance")
-	return NewRefView(windowViewFactory.repoData, windowViewFactory.channels)
+	return NewRefView(windowViewFactory.repoData, windowViewFactory.repoController, windowViewFactory.channels,
+		windowViewFactory.config, windowViewFactory.variables)
 }
 
 func (windowViewFactory *WindowViewFactory) createCommitView(args []interface{}) (commitView *CommitView, err error) {
@@ -60,14 +69,17 @@ func (windowViewFactory *WindowViewFactory) createCommitView(args []interface{})
 		return
 	}
 
-	commitView = NewCommitView(windowViewFactory.repoData, windowViewFactory.channels)
+	commitView = NewCommitView(windowViewFactory.repoData, windowViewFactory.repoController, windowViewFactory.channels,
+		windowViewFactory.config, windowViewFactory.variables)
 
 	log.Info("Created CommitView instance")
 
-	if ref != nil {
-		log.Debugf("Providing Ref to CommitView instance %v:%v", ref.Name(), ref.Oid())
-		err = commitView.OnRefSelect(ref)
+	if ref == nil {
+		ref = windowViewFactory.repoData.Head()
 	}
+
+	log.Debugf("Providing Ref to CommitView instance %v:%v", ref.Name(), ref.Oid())
+	err = commitView.OnRefSelect(ref)
 
 	return
 }
@@ -78,7 +90,7 @@ func (windowViewFactory *WindowViewFactory) createDiffView(args []interface{}) (
 		return
 	}
 
-	diffView = NewDiffView(windowViewFactory.repoData, windowViewFactory.channels)
+	diffView = NewDiffView(windowViewFactory.repoData, windowViewFactory.channels, windowViewFactory.config, windowViewFactory.variables)
 
 	log.Info("Created DiffView instance")
 
@@ -96,14 +108,27 @@ func (windowViewFactory *WindowViewFactory) createDiffView(args []interface{}) (
 }
 
 func (windowViewFactory *WindowViewFactory) createGitStatusView() *GitStatusView {
-	gitStatusView := NewGitStatusView(windowViewFactory.repoData, windowViewFactory.channels)
+	gitStatusView := NewGitStatusView(windowViewFactory.repoData, windowViewFactory.repoController, windowViewFactory.channels,
+		windowViewFactory.config, windowViewFactory.variables)
 
-	status := windowViewFactory.repoData.Status()
-	gitStatusView.OnStatusChanged(status)
+	if status := windowViewFactory.repoData.Status(); status != nil {
+		gitStatusView.OnStatusChanged(status)
+	}
 
 	log.Info("Created GitStatusView instance")
 
 	return gitStatusView
+}
+
+func (windowViewFactory *WindowViewFactory) createGRVVariableView() *GRVVariableView {
+	log.Info("Created GRVVariableView instance")
+	return NewGRVVariableView(windowViewFactory.channels, windowViewFactory.config, windowViewFactory.variables)
+}
+
+func (windowViewFactory *WindowViewFactory) createRemoteView() *RemoteView {
+	log.Info("Created GRVVariableView instance")
+	return NewRemoteView(windowViewFactory.repoData, windowViewFactory.repoController,
+		windowViewFactory.channels, windowViewFactory.config, windowViewFactory.variables)
 }
 
 func (windowViewFactory *WindowViewFactory) getRef(args []interface{}) (ref Ref, err error) {
@@ -137,4 +162,50 @@ func (windowViewFactory *WindowViewFactory) getRef(args []interface{}) (ref Ref,
 	}
 
 	return
+}
+
+// GenerateWindowViewFactoryHelpSection generates a help documentation table of supported views
+func GenerateWindowViewFactoryHelpSection(config Config) *HelpSection {
+	headers := []TableHeader{
+		{text: "View", themeComponentID: CmpHelpViewSectionTableHeader},
+		{text: "Args", themeComponentID: CmpHelpViewSectionTableHeader},
+	}
+
+	tableFormatter := NewTableFormatterWithHeaders(headers, config)
+	tableFormatter.SetGridLines(true)
+
+	type viewConstructor struct {
+		viewID ViewID
+		args   string
+	}
+
+	viewConstructors := []viewConstructor{
+		{
+			viewID: ViewCommit,
+			args:   "ref or oid",
+		},
+		{
+			viewID: ViewDiff,
+			args:   "oid",
+		},
+		{
+			viewID: ViewGitStatus,
+			args:   "none",
+		},
+		{
+			viewID: ViewRef,
+			args:   "none",
+		},
+	}
+
+	tableFormatter.Resize(uint(len(viewConstructors)))
+
+	for rowIndex, constructor := range viewConstructors {
+		tableFormatter.SetCellWithStyle(uint(rowIndex), 0, CmpHelpViewSectionTableRow, "%v", ViewName(constructor.viewID))
+		tableFormatter.SetCellWithStyle(uint(rowIndex), 1, CmpHelpViewSectionTableRow, "%v", constructor.args)
+	}
+
+	return &HelpSection{
+		tableFormatter: tableFormatter,
+	}
 }

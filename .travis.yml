@@ -1,4 +1,9 @@
+if: tag != latest
+
 language: go
+
+go:
+  - "1.x"
 
 os:
   - linux
@@ -11,6 +16,9 @@ addons:
       - libncursesw5-dev
       - libreadline-dev
       - libgit2-dev
+      - libgpm-dev
 
 script:
-  - make test
+  - make test && make clean &&
+    if [ "$TRAVIS_OS_NAME" = 'linux' ]; then make static; fi
+

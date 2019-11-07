@@ -2,8 +2,10 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
@@ -34,23 +36,40 @@ type gRVChannels struct {
 	errorCh    chan error
 }
 
-func (grvChannels gRVChannels) Channels() *Channels {
-	return &Channels{
-		displayCh: grvChannels.displayCh,
-		exitCh:    grvChannels.exitCh,
-		errorCh:   grvChannels.errorCh,
-		actionCh:  grvChannels.actionCh,
-		eventCh:   grvChannels.eventCh,
+func (grvChannels gRVChannels) Channels() *channels {
+	return &channels{
+		displayCh:  grvChannels.displayCh,
+		exitCh:     grvChannels.exitCh,
+		errorCh:    grvChannels.errorCh,
+		actionCh:   grvChannels.actionCh,
+		eventCh:    grvChannels.eventCh,
+		inputKeyCh: grvChannels.inputKeyCh,
 	}
 }
 
 // Channels contains channels used for communication within grv
-type Channels struct {
-	displayCh chan<- bool
-	exitCh    <-chan bool
-	errorCh   chan<- error
-	actionCh  chan<- Action
-	eventCh   chan<- Event
+type Channels interface {
+	UpdateDisplay()
+	Exit() bool
+	ReportError(err error)
+	ReportErrors(errors []error)
+	DoAction(action Action)
+	ReportEvent(event Event)
+	ReportStatus(format string, args ...interface{})
+}
+
+type channels struct {
+	displayCh  chan<- bool
+	exitCh     <-chan bool
+	errorCh    chan<- error
+	actionCh   chan<- Action
+	eventCh    chan<- Event
+	inputKeyCh chan<- string
+}
+
+// InputConsumer can consumer and process key string input
+type InputConsumer interface {
+	ProcessInput(input string)
 }
 
 // EventType identifies a type of event
@@ -75,18 +94,21 @@ type EventListener interface {
 
 // GRV is the top level structure containing all state in the program
 type GRV struct {
-	repoData       *RepositoryData
-	view           *View
-	ui             UI
-	channels       gRVChannels
-	config         *Configuration
-	inputBuffer    *InputBuffer
-	input          *InputKeyMapper
-	eventListeners []EventListener
+	repoInitialiser *RepositoryInitialiser
+	repoData        *RepositoryData
+	repoController  RepoController
+	view            *View
+	ui              UI
+	channels        gRVChannels
+	config          *Configuration
+	inputBuffer     *InputBuffer
+	input           *InputKeyMapper
+	eventListeners  []EventListener
+	variables       *GRVVariables
 }
 
 // UpdateDisplay sends a request to update the display
-func (channels *Channels) UpdateDisplay() {
+func (channels *channels) UpdateDisplay() {
 	select {
 	case channels.displayCh <- true:
 	default:
@@ -94,7 +116,7 @@ func (channels *Channels) UpdateDisplay() {
 }
 
 // Exit returns true if GRV is in the process of exiting
-func (channels *Channels) Exit() bool {
+func (channels *channels) Exit() bool {
 	select {
 	case _, ok := <-channels.exitCh:
 		return !ok
@@ -104,7 +126,7 @@ func (channels *Channels) Exit() bool {
 }
 
 // ReportError reports an error to be displayed
-func (channels *Channels) ReportError(err error) {
+func (channels *channels) ReportError(err error) {
 	if err != nil {
 		select {
 		case channels.errorCh <- err:
@@ -115,28 +137,28 @@ func (channels *Channels) ReportError(err error) {
 }
 
 // ReportErrors reports multiple errors to be displayed
-func (channels *Channels) ReportErrors(errors []error) {
+func (channels *channels) ReportErrors(errors []error) {
 	for _, err := range errors {
 		channels.ReportError(err)
 	}
 }
 
 // DoAction sends an action to be executed
-func (channels *Channels) DoAction(action Action) {
+func (channels *channels) DoAction(action Action) {
 	if action.ActionType != ActionNone {
 		channels.actionCh <- action
 	}
 }
 
 // ReportEvent sends the event to all listeners
-func (channels *Channels) ReportEvent(event Event) {
+func (channels *channels) ReportEvent(event Event) {
 	if event.EventType != NoEvent {
 		channels.eventCh <- event
 	}
 }
 
 // ReportStatus updates the status bar with the provided status
-func (channels *Channels) ReportStatus(format string, args ...interface{}) {
+func (channels *channels) ReportStatus(format string, args ...interface{}) {
 	status := fmt.Sprintf(format, args...)
 
 	if status != "" {
@@ -147,8 +169,17 @@ func (channels *Channels) ReportStatus(format string, args ...interface{}) {
 	}
 }
 
+// ProcessInput sends the provided input to be processed
+func (channels *channels) ProcessInput(input string) {
+	select {
+	case channels.inputKeyCh <- input:
+	default:
+		log.Errorf("Unable to add input \"%v\" to input channel", input)
+	}
+}
+
 // NewGRV creates a new instace of GRV
-func NewGRV() *GRV {
+func NewGRV(readOnly bool) *GRV {
 	grvChannels := gRVChannels{
 		exitCh:     make(chan bool),
 		inputKeyCh: make(chan string, grvInputBufferSize),
@@ -159,23 +190,36 @@ func NewGRV() *GRV {
 	}
 
 	channels := grvChannels.Channels()
-
-	repoDataLoader := NewRepoDataLoader(channels)
-	repoData := NewRepositoryData(repoDataLoader, channels)
 	keyBindings := NewKeyBindingManager()
-	config := NewConfiguration(keyBindings, channels)
-	ui := NewNCursesDisplay(config)
-	view := NewView(repoData, channels, config)
+	variables := NewGRVVariables()
+	config := NewConfiguration(keyBindings, channels, variables, channels)
+
+	repoDataLoader := NewRepoDataLoader(channels, config)
+	repoData := NewRepositoryData(repoDataLoader, channels, variables)
+
+	var repoController RepoController
+	if readOnly {
+		log.Info("Running grv in read only mode")
+		repoController = NewReadOnlyRepositoryController()
+	} else {
+		repoController = NewGitCommandRepoController(repoData, channels, config)
+	}
+
+	ui := NewNCursesDisplay(channels, config)
+	view := NewView(repoData, repoController, channels, config, variables)
 
 	return &GRV{
-		repoData:       repoData,
-		view:           view,
-		ui:             ui,
-		channels:       grvChannels,
-		config:         config,
-		inputBuffer:    NewInputBuffer(keyBindings),
-		input:          NewInputKeyMapper(ui),
-		eventListeners: []EventListener{view, repoData},
+		repoInitialiser: NewRepositoryInitialiser(),
+		repoData:        repoData,
+		repoController:  repoController,
+		view:            view,
+		ui:              ui,
+		channels:        grvChannels,
+		config:          config,
+		inputBuffer:     NewInputBuffer(keyBindings),
+		input:           NewInputKeyMapper(ui),
+		eventListeners:  []EventListener{view, repoData, config},
+		variables:       variables,
 	}
 }
 
@@ -183,9 +227,21 @@ func NewGRV() *GRV {
 func (grv *GRV) Initialise(repoPath, workTreePath string) (err error) {
 	log.Info("Initialising GRV")
 
-	if err = grv.repoData.Initialise(repoPath, workTreePath); err != nil {
+	channels := grv.channels.Channels()
+
+	if configErrors := grv.config.Initialise(); configErrors != nil {
+		channels.ReportErrors(configErrors)
+	}
+
+	if err = grv.repoInitialiser.CreateRepositoryInstance(repoPath, workTreePath); err != nil {
 		return
 	}
+
+	if err = grv.repoData.Initialise(grv.repoInitialiser); err != nil {
+		return
+	}
+
+	grv.repoController.Initialise(grv.repoInitialiser)
 
 	if err = grv.ui.Initialise(); err != nil {
 		return
@@ -195,14 +251,7 @@ func (grv *GRV) Initialise(repoPath, workTreePath string) (err error) {
 		return
 	}
 
-	if configErrors := grv.config.Initialise(); configErrors != nil {
-		for _, configError := range configErrors {
-			grv.channels.errorCh <- configError
-		}
-	}
-
-	channels := grv.channels.Channels()
-	InitReadLine(channels, grv.ui, grv.config)
+	InitReadLine(channels, grv.config)
 
 	return
 }
@@ -214,6 +263,7 @@ func (grv *GRV) Free() {
 	FreeReadLine()
 	grv.ui.Free()
 	grv.repoData.Free()
+	grv.repoInitialiser.Free()
 }
 
 // Suspend prepares GRV to be suspended and sends a SIGTSTP
@@ -247,6 +297,8 @@ func (grv *GRV) End() {
 	if err := grv.ui.CancelGetInput(); err != nil {
 		log.Errorf("Error calling CancelGetInput: %v", err)
 	}
+
+	grv.view.Dispose()
 }
 
 // Run sets up the input, display, action and singal handler loops
@@ -282,6 +334,15 @@ func (grv *GRV) runInputLoop(waitGroup *sync.WaitGroup, exitCh chan bool, inputK
 		key, err := grv.input.GetKeyInput()
 		if err != nil {
 			errorCh <- err
+		} else if key == "<Mouse>" {
+			if mouseEvent, exists := grv.ui.GetMouseEvent(); exists {
+				mouseEventAction, err := MouseEventAction(mouseEvent)
+				if err != nil {
+					errorCh <- err
+				} else {
+					grv.channels.actionCh <- mouseEventAction
+				}
+			}
 		} else if key != "" {
 			log.Debugf("Received keypress from UI %v", key)
 
@@ -309,7 +370,7 @@ func (grv *GRV) runDisplayLoop(waitGroup *sync.WaitGroup, exitCh <-chan bool, di
 
 	var errors []error
 	lastErrorReceivedTime := time.Now()
-	channels := &Channels{errorCh: errorCh}
+	channels := &channels{errorCh: errorCh}
 
 	timer := time.NewTimer(time.Hour)
 	timer.Stop()
@@ -391,7 +452,23 @@ func (grv *GRV) runHandlerLoop(waitGroup *sync.WaitGroup, exitCh <-chan bool, in
 				action, keystring := grv.inputBuffer.Process(viewHierarchy)
 
 				if action.ActionType != ActionNone {
-					actionCh <- action
+					if IsPromptAction(action.ActionType) {
+						keys, enterFound := grv.inputBuffer.DiscardTo("<Enter>")
+						if enterFound {
+							keys = strings.TrimSuffix(keys, "<Enter>")
+						}
+
+						action.Args = append(action.Args, ActionPromptArgs{
+							keys:       keys,
+							terminated: enterFound,
+						})
+
+						if err := grv.view.HandleAction(action); err != nil {
+							errorCh <- err
+						}
+					} else {
+						actionCh <- action
+					}
 				} else if keystring != "" {
 					log.Debugf("Dropping keystring: %v", keystring)
 				} else {
@@ -404,6 +481,14 @@ func (grv *GRV) runHandlerLoop(waitGroup *sync.WaitGroup, exitCh <-chan bool, in
 				grv.End()
 			case ActionSuspend:
 				grv.Suspend()
+			case ActionRunCommand:
+				if err := grv.runCommand(action); err != nil {
+					errorCh <- err
+				}
+			case ActionSleep:
+				if err := grv.sleep(action); err != nil {
+					errorCh <- err
+				}
 			default:
 				if err := grv.view.HandleAction(action); err != nil {
 					errorCh <- err
@@ -424,6 +509,103 @@ func (grv *GRV) runHandlerLoop(waitGroup *sync.WaitGroup, exitCh <-chan bool, in
 	}
 }
 
+func (grv *GRV) runCommand(action Action) (err error) {
+	if len(action.Args) == 0 {
+		return fmt.Errorf("Expected argument of type ActionRunCommandArgs")
+	}
+
+	arg, ok := action.Args[0].(ActionRunCommandArgs)
+	if !ok {
+		return fmt.Errorf("Expected argument of type ActionRunCommandArgs but found type %T", action.Args[0])
+	}
+
+	var cmd *exec.Cmd
+
+	if arg.noShell {
+		cmd = exec.Command(arg.command, arg.args...)
+	} else {
+		cmd = exec.Command("/bin/sh", "-c", arg.command)
+	}
+
+	if arg.stdin != nil {
+		cmd.Stdin = arg.stdin
+	}
+
+	if arg.stdout != nil {
+		cmd.Stdout = arg.stdout
+	}
+
+	if arg.stderr != nil {
+		cmd.Stderr = arg.stderr
+	}
+
+	cmd.Env, cmd.Dir = grv.repoData.GenerateGitCommandEnvironment()
+
+	if arg.interactive {
+		grv.ui.Suspend()
+	}
+
+	if arg.beforeStart != nil {
+		arg.beforeStart(cmd)
+	}
+
+	cmdError := cmd.Start()
+
+	if cmdError == nil {
+		if arg.onStart != nil {
+			arg.onStart(cmd)
+		}
+
+		cmdError = cmd.Wait()
+	}
+
+	if arg.interactive {
+		if arg.promptForInput && grv.config.GetBool(CfInputPromptAfterCommand) {
+			cmd.Stdout.Write([]byte("\nPress any key to continue"))
+			bufio.NewReader(cmd.Stdin).ReadByte()
+		}
+
+		if err = grv.ui.Resume(); err != nil {
+			return
+		}
+	}
+
+	exitStatus := -1
+
+	if cmdError != nil {
+		if exitError, ok := cmdError.(*exec.ExitError); ok {
+			waitStatus := exitError.Sys().(syscall.WaitStatus)
+			exitStatus = waitStatus.ExitStatus()
+		}
+	} else {
+		waitStatus := cmd.ProcessState.Sys().(syscall.WaitStatus)
+		exitStatus = waitStatus.ExitStatus()
+	}
+
+	if arg.onComplete != nil {
+		err = arg.onComplete(cmdError, exitStatus)
+	}
+
+	return
+}
+
+func (grv *GRV) sleep(action Action) (err error) {
+	if len(action.Args) == 0 {
+		return fmt.Errorf("Expected sleep seconds argument")
+	}
+
+	sleepSeconds, ok := action.Args[0].(float64)
+	if !ok {
+		return fmt.Errorf("Expected sleep seconds of type float64 but found type %T", action.Args[0])
+	}
+
+	log.Infof("Sleeping for %v seconds", sleepSeconds)
+	time.Sleep(time.Duration(sleepSeconds*1000) * time.Millisecond)
+	log.Infof("Finished sleeping")
+
+	return
+}
+
 func (grv *GRV) runSignalHandlerLoop(waitGroup *sync.WaitGroup, exitCh <-chan bool) {
 	defer waitGroup.Done()
 	defer log.Info("Signal handler loop stopping")
@@ -440,8 +622,13 @@ func (grv *GRV) runSignalHandlerLoop(waitGroup *sync.WaitGroup, exitCh <-chan bo
 
 			switch signal {
 			case syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGHUP:
-				grv.End()
-				return
+				if signal == syscall.SIGINT && ReadLineActive() {
+					log.Debugf("Readline is active - cancelling readline")
+					CancelReadline()
+				} else {
+					grv.End()
+					return
+				}
 			case syscall.SIGCONT:
 				grv.Resume()
 			case syscall.SIGWINCH:
@@ -467,7 +654,7 @@ func (grv *GRV) runFileSystemMonitorLoop(waitGroup *sync.WaitGroup, exitCh <-cha
 	channels := grv.channels.Channels()
 	eventCh := make(chan fs.EventInfo, 1)
 	repoGitDir := grv.repoData.Path()
-	repoFilePath := strings.TrimSuffix(repoGitDir, GitRepositoryDirectoryName+"/")
+	repoFilePath := grv.repoData.RepositoryRootPath()
 	watchDir := repoFilePath + "..."
 
 	if err := fs.Watch(watchDir, eventCh, fs.All); err != nil {
@@ -516,13 +703,11 @@ func (grv *GRV) runFileSystemMonitorLoop(waitGroup *sync.WaitGroup, exitCh <-cha
 		case <-timer.C:
 			timerActive = false
 
-			if err := grv.repoData.LoadStatus(); err != nil {
-				channels.ReportError(err)
-			}
-
 			if gitDirModified {
-				grv.repoData.LoadRefs(nil)
+				grv.repoData.Reload(nil)
 				gitDirModified = false
+			} else if err := grv.repoData.LoadStatus(); err != nil {
+				channels.ReportError(err)
 			}
 		case _, ok := <-exitCh:
 			if !ok {

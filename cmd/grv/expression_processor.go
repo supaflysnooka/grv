@@ -153,6 +153,12 @@ var fieldTypeNames = map[FieldType]string{
 	FtRegex:   "Regex",
 }
 
+// FieldTypeName returns the name of the provided FieldType
+func FieldTypeName(fieldType FieldType) (fieldTypeName string) {
+	fieldTypeName, _ = fieldTypeNames[fieldType]
+	return
+}
+
 // TypeDescriptor returns the type of a field or value
 type TypeDescriptor interface {
 	FieldType(fieldTypeDescriptor FieldTypeDescriptor) FieldType
@@ -396,8 +402,7 @@ func (binaryExpression *BinaryExpression) processDateComparison(fieldTypeDescrip
 		return GenerateExpressionError(dateString, "Unable to parse date %v: %v", dateString.value.value, err)
 	}
 
-	dateTime := time.Date(utcDateTime.Year(), utcDateTime.Month(), utcDateTime.Day(), utcDateTime.Hour(),
-		utcDateTime.Minute(), utcDateTime.Second(), utcDateTime.Nanosecond(), time.Local)
+	dateTime := TimeWithLocation(utcDateTime, time.Local)
 
 	*datePtr = &DateLiteral{
 		dateTime:   dateTime,

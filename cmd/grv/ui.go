@@ -8,6 +8,7 @@ package main
 // #include <locale.h>
 // #include <sys/select.h>
 // #include <sys/ioctl.h>
+// #include <curses.h>
 //
 // static void grv_FD_ZERO(void *set) {
 // 	FD_ZERO((fd_set *)set);
@@ -19,6 +20,14 @@ package main
 //
 // static int grv_FD_ISSET(int fd, void *set) {
 // 	return FD_ISSET(fd, (fd_set *)set);
+// }
+//
+// static long grv_is_scroll_down(long button) {
+//#if defined(NCURSES_MOUSE_VERSION) && NCURSES_MOUSE_VERSION > 1
+// 	return button & BUTTON_ALT;
+//#else
+//	return button & BUTTON2_PRESSED;
+//#endif
 // }
 //
 import "C"
@@ -41,6 +50,23 @@ const (
 	UINoKey         = -1
 	inputNoWinSleep = 50 * time.Millisecond
 )
+
+// MouseEventType differentiates mouse events
+type MouseEventType int
+
+// The set of supported mouse events
+const (
+	MetLeftClick MouseEventType = iota
+	MetScrollDown
+	MetScrollUp
+)
+
+// MouseEvent contains data for a mouse event
+type MouseEvent struct {
+	mouseEventType MouseEventType
+	row            uint
+	col            uint
+}
 
 var systemColors = map[SystemColorValue]int16{
 	ColorNone:    -1,
@@ -88,6 +114,7 @@ type Key int
 type InputUI interface {
 	GetInput(force bool) (Key, error)
 	CancelGetInput() error
+	GetMouseEvent() (event MouseEvent, exists bool)
 }
 
 // UI exposes methods for updaing the display
@@ -130,19 +157,27 @@ type NCursesUI struct {
 	windows       map[*Window]*nCursesWindow
 	lock          sync.Mutex
 	stdscr        *nCursesWindow
+	channels      Channels
 	config        Config
 	pipe          signalPipe
 	maxColors     int
 	maxColorPairs int
 	suspended     bool
+	suspendedLock *sync.Cond
+	colorPairs    map[ThemeComponentID]int16
 }
 
 // NewNCursesDisplay creates a new NCursesUI instance
-func NewNCursesDisplay(config Config) *NCursesUI {
-	return &NCursesUI{
-		windows: make(map[*Window]*nCursesWindow),
-		config:  config,
+func NewNCursesDisplay(channels Channels, config Config) *NCursesUI {
+	ui := &NCursesUI{
+		windows:  make(map[*Window]*nCursesWindow),
+		channels: channels,
+		config:   config,
 	}
+
+	ui.suspendedLock = sync.NewCond(&ui.lock)
+
+	return ui
 }
 
 // Free releases ncurses resourese used
@@ -184,6 +219,7 @@ func (ui *NCursesUI) Initialise() (err error) {
 	}
 
 	ui.config.AddOnChangeListener(CfTheme, ui)
+	ui.config.AddOnChangeListener(CfMouse, ui)
 
 	read, write, err := os.Pipe()
 	if err != nil {
@@ -226,9 +262,12 @@ func (ui *NCursesUI) initialiseNCurses() (err error) {
 
 	gc.Echo(false)
 	gc.Raw(true)
+	gc.MouseInterval(0)
 
-	if err = gc.Cursor(0); err != nil {
-		return fmt.Errorf("NCurses Cursor failed: %v", err)
+	ui.updateMouseState()
+
+	if gc.Cursor(0) != nil {
+		log.Debugf("Unable to hide cursor")
 	}
 
 	if err = ui.stdscr.Keypad(true); err != nil {
@@ -256,6 +295,8 @@ func (ui *NCursesUI) Resume() (err error) {
 
 	ui.stdscr.Refresh()
 	ui.suspended = false
+	ui.suspendedLock.Broadcast()
+
 	return ui.resize()
 }
 
@@ -303,6 +344,9 @@ func (ui *NCursesUI) ViewDimension() ViewDimension {
 // Update draws the provided windows to the terminal display
 func (ui *NCursesUI) Update(wins []*Window) (err error) {
 	ui.lock.Lock()
+	for ui.suspended {
+		ui.suspendedLock.Wait()
+	}
 	defer ui.lock.Unlock()
 
 	log.Debug("Updating display")
@@ -323,7 +367,7 @@ func (ui *NCursesUI) Update(wins []*Window) (err error) {
 }
 
 func (ui *NCursesUI) createAndUpdateWindows(wins []*Window) (err error) {
-	log.Debug("Creating and updating NCurses windows")
+	log.Trace("Creating and updating NCurses windows")
 
 	winMap := make(map[*Window]bool)
 
@@ -336,13 +380,13 @@ func (ui *NCursesUI) createAndUpdateWindows(wins []*Window) (err error) {
 			nwin.Resize(int(win.rows), int(win.cols))
 			nwin.MoveWindow(int(win.startRow), int(win.startCol))
 			nwin.setHidden(false)
-			log.Debugf("Moving NCurses window %v to row:%v,col:%v", win.ID(), win.startRow, win.startCol)
+			log.Tracef("Moving NCurses window %v to row:%v,col:%v", win.ID(), win.startRow, win.startCol)
 		} else if !nwin.hidden() {
 			nwin.Erase()
 			nwin.Resize(0, 0)
 			nwin.NoutRefresh()
 			nwin.setHidden(true)
-			log.Debugf("Hiding NCurses window %v - %v:%v", win.ID())
+			log.Tracef("Hiding NCurses window %v", win.ID())
 		}
 	}
 
@@ -383,7 +427,7 @@ func (ui *NCursesUI) drawWindows(wins []*Window) (err error) {
 
 	for _, win := range wins {
 		if nwin, ok := ui.windows[win]; ok {
-			drawWindow(win, nwin)
+			ui.drawWindow(win, nwin)
 
 			if win.IsCursorSet() {
 				cursorWin = win
@@ -394,28 +438,22 @@ func (ui *NCursesUI) drawWindows(wins []*Window) (err error) {
 	}
 
 	if cursorWin == nil {
-		err = gc.Cursor(0)
+		ui.setCursorVisible(false)
 	} else {
-		if err = gc.Cursor(1); err != nil {
-			return
-		}
+		ui.setCursorVisible(true)
 
 		nwin := ui.windows[cursorWin]
 		nwin.Move(int(cursorWin.cursor.row), int(cursorWin.cursor.col))
 		nwin.NoutRefresh()
 	}
 
-	if err != nil {
-		return fmt.Errorf("NCurses Cursor failed: %v", err)
-	}
-
 	return
 }
 
-func drawWindow(win *Window, nwin *nCursesWindow) {
-	log.Debugf("Drawing window %v", win.ID())
+func (ui *NCursesUI) drawWindow(win *Window, nwin *nCursesWindow) {
+	log.Tracef("Drawing window %v", win.ID())
 
-	nwin.SetBackground(gc.ColorPair(int16(CmpAllviewDefault)))
+	nwin.SetBackground(gc.ColorPair(ui.colorPair(CmpAllviewDefault)))
 
 	for rowIndex := uint(0); rowIndex < win.rows; rowIndex++ {
 		line := win.lines[rowIndex]
@@ -425,7 +463,7 @@ func drawWindow(win *Window, nwin *nCursesWindow) {
 			cell := line.cells[colIndex]
 
 			if cell.style.acsChar != 0 || cell.codePoints.Len() > 0 {
-				attr := cell.style.attr | gc.ColorPair(int16(cell.style.themeComponentID))
+				attr := cell.style.attr | gc.ColorPair(ui.colorPair(cell.style.themeComponentID))
 				if err := nwin.AttrOn(attr); err != nil {
 					log.Errorf("Error when attempting to set AttrOn with %v: %v", attr, err)
 				}
@@ -446,15 +484,25 @@ func drawWindow(win *Window, nwin *nCursesWindow) {
 	nwin.NoutRefresh()
 }
 
+func (ui *NCursesUI) colorPair(themeComponentID ThemeComponentID) int16 {
+	if colorPairID, ok := ui.colorPairs[themeComponentID]; ok {
+		return colorPairID
+	}
+
+	return 0
+}
+
 // GetInput blocks until user input is available
 // A single key code is returned on each invocation
 // Setting force = true makes this function non-blocking.
 func (ui *NCursesUI) GetInput(force bool) (key Key, err error) {
 	key = UINoKey
 
-	if ui.suspended {
-		return
+	ui.lock.Lock()
+	for ui.suspended {
+		ui.suspendedLock.Wait()
 	}
+	ui.lock.Unlock()
 
 	if !force {
 		rfds := &syscall.FdSet{}
@@ -468,14 +516,13 @@ func (ui *NCursesUI) GetInput(force bool) (key Key, err error) {
 			fdSet(pipeFd, rfds)
 			nullPointer := uintptr(unsafe.Pointer(nil))
 
-			if _, _, errno := syscall.Syscall6(SelectSyscallID(), uintptr(pipeFd+1), uintptr(unsafe.Pointer(rfds)),
-				nullPointer, nullPointer, nullPointer, 0); errno != 0 {
-				err = errno
-			}
+			_, _, errno := syscall.Syscall6(SelectSyscallID(), uintptr(pipeFd+1), uintptr(unsafe.Pointer(rfds)),
+				nullPointer, nullPointer, nullPointer, 0)
 
 			switch {
-			case err != nil:
-				err = fmt.Errorf("Select system call failed: %v", err)
+			case errno == syscall.EINTR:
+			case errno != 0:
+				err = fmt.Errorf("Select system call failed: %v", errno.Error())
 				return
 			case fdIsset(pipeFd, rfds):
 				if _, err := ui.pipe.read.Read(make([]byte, 8)); err != nil {
@@ -532,13 +579,89 @@ func (ui *NCursesUI) cancelGetInput() error {
 	return err
 }
 
-func (ui *NCursesUI) onConfigVariableChange(configVariable ConfigVariable) {
-	theme := ui.config.GetTheme()
+// GetMouseEvent returns the most recent mouse event or an error if none exists
+func (ui *NCursesUI) GetMouseEvent() (event MouseEvent, exists bool) {
+	mouseEvent := gc.GetMouse()
 
+	mouseEventType, exists := ui.getMouseEventType(mouseEvent)
+
+	if exists {
+		event = MouseEvent{
+			mouseEventType: mouseEventType,
+		}
+
+		if mouseEvent != nil {
+			event.row = uint(mouseEvent.Y)
+			event.col = uint(mouseEvent.X)
+		}
+
+		log.Debugf("Mouse event: %v", event)
+	}
+
+	return
+}
+
+func (ui *NCursesUI) getMouseEventType(mouseEvent *gc.MouseEvent) (mouseEventType MouseEventType, exists bool) {
+	var button gc.MouseButton
+	if mouseEvent == nil {
+		button = gc.M_B2_PRESSED
+	} else {
+		button = mouseEvent.State
+	}
+
+	log.Debugf("Ncurses button: %v", button)
+
+	switch {
+	case (button & gc.M_B1_PRESSED) != 0:
+		mouseEventType = MetLeftClick
+		exists = true
+	case (button & (gc.M_B4_PRESSED | gc.M_B4_TPL_CLICKED | gc.M_B4_DBL_CLICKED)) != 0:
+		mouseEventType = MetScrollUp
+		exists = true
+	case C.grv_is_scroll_down(C.long(button)) != 0:
+		mouseEventType = MetScrollDown
+		exists = true
+	}
+
+	log.Debugf("MouseEventType: %v", mouseEventType)
+
+	return
+}
+
+func (ui *NCursesUI) setCursorVisible(visible bool) {
+	var cursorVisible byte
+	if visible {
+		cursorVisible = 1
+	} else {
+		cursorVisible = 0
+	}
+
+	gc.Cursor(cursorVisible)
+}
+
+func (ui *NCursesUI) onConfigVariableChange(configVariable ConfigVariable) {
 	ui.lock.Lock()
 	defer ui.lock.Unlock()
 
-	ui.initialiseColorPairsFromTheme(theme)
+	switch configVariable {
+	case CfTheme:
+		theme := ui.config.GetTheme()
+		ui.initialiseColorPairsFromTheme(theme)
+	case CfMouse:
+		ui.updateMouseState()
+	default:
+		log.Warnf("Received notification for variable I didn't register for: %v", configVariable)
+	}
+}
+
+func (ui *NCursesUI) updateMouseState() {
+	if ui.config.GetBool(CfMouse) {
+		log.Infof("Mouse enabled")
+		gc.MouseMask(gc.M_ALL, nil)
+	} else {
+		log.Infof("Mouse disabled")
+		gc.MouseMask(0, nil)
+	}
 }
 
 func (ui *NCursesUI) initialiseColorPairsFromTheme(theme Theme) {
@@ -546,13 +669,16 @@ func (ui *NCursesUI) initialiseColorPairsFromTheme(theme Theme) {
 	fgDefault := ui.getNCursesColor(defaultComponent.fgcolor)
 	bgDefault := ui.getNCursesColor(defaultComponent.bgcolor)
 
-	for themeComponentID, themeComponent := range theme.GetAllComponents() {
-		if int(themeComponentID) >= ui.maxColorPairs {
-			log.Errorf("Not enough color pairs for theme. Required: %v, Actual: %v",
-				len(theme.GetAllComponents()), ui.maxColorPairs)
-			break
-		}
+	type colorPair struct {
+		fgcolor int16
+		bgcolor int16
+	}
 
+	distinctColorPairs := map[colorPair]int16{}
+	ui.colorPairs = map[ThemeComponentID]int16{}
+	colorPairID := int16(1)
+
+	for themeComponentID, themeComponent := range theme.GetAllComponents() {
 		fgcolor := ui.getNCursesColor(themeComponent.fgcolor)
 		bgcolor := ui.getNCursesColor(themeComponent.bgcolor)
 
@@ -563,10 +689,27 @@ func (ui *NCursesUI) initialiseColorPairsFromTheme(theme Theme) {
 			bgcolor = bgDefault
 		}
 
-		log.Debugf("Initialising color pair for ThemeComponentID %v - %v:%v", themeComponentID, fgcolor, bgcolor)
+		colorPair := colorPair{
+			fgcolor: fgcolor,
+			bgcolor: bgcolor,
+		}
 
-		if err := gc.InitPair(int16(themeComponentID), fgcolor, bgcolor); err != nil {
-			log.Errorf("Ncurses InitPair failed. Error when seting color pair %v:%v - %v", fgcolor, bgcolor, err)
+		if existingColorPair, ok := distinctColorPairs[colorPair]; ok {
+			ui.colorPairs[themeComponentID] = existingColorPair
+		} else if int(colorPairID) > ui.maxColorPairs {
+			ui.channels.ReportError(fmt.Errorf("Not enough color pairs for theme - GRV may not display correctly"))
+			return
+		} else {
+			distinctColorPairs[colorPair] = colorPairID
+			ui.colorPairs[themeComponentID] = colorPairID
+
+			log.Debugf("Initialising color pair %v - %v:%v", colorPairID, fgcolor, bgcolor)
+
+			if err := gc.InitPair(colorPairID, fgcolor, bgcolor); err != nil {
+				log.Errorf("Ncurses InitPair failed. Error when seting color pair %v:%v - %v", fgcolor, bgcolor, err)
+			}
+
+			colorPairID++
 		}
 	}
 }
